@@ -27,6 +27,13 @@ from solver_bridge import (  # noqa: E402
     validate,
 )
 
+# LINE 上でのブランド説明は、量子優位性をうたわず、PoC の位置づけを明示する。
+POC_BRANDING_COPY = (
+    "OpenQARP（量子アプリ）で試作した店舗シフトPoCです。"
+    "組表本体は古典ソルバで、店長確認前提です。"
+)
+
+
 DAY_ALIASES: dict[str, str] = {
     "月": "月",
     "月曜": "月",
@@ -336,10 +343,7 @@ def build_shift_text(result: dict[str, Any], *, header: str | None = None) -> st
         f"休み: {', '.join(classical['focus_off']) or '—'}"
     )
     lines.append("")
-    lines.append(
-        "※ PoC・店長確認前提。本体は古典ソルバ。"
-        " Powered by OpenQARP"
-    )
+    lines.append(f"※ {POC_BRANDING_COPY} Powered by OpenQARP")
     return "\n".join(lines)
 
 
@@ -453,7 +457,10 @@ def build_shift_flex(result: dict[str, Any], *, alt_text: str | None = None) -> 
             "contents": [
                 {
                     "type": "text",
-                    "text": "PoC・店長確認前提 ／ 本体は古典 ／ Powered by OpenQARP",
+                    "text": (
+                        "OpenQARP（量子アプリ）で試作した店舗シフトPoC ／ "
+                        "組表本体は古典ソルバ・店長確認前提"
+                    ),
                     "size": "xxs",
                     "color": "#94a3b8",
                     "wrap": True,
@@ -465,7 +472,7 @@ def build_shift_flex(result: dict[str, Any], *, alt_text: str | None = None) -> 
 
     return {
         "type": "flex",
-        "altText": alt_text or "今週のシフト案",
+        "altText": f"{alt_text or '今週のシフト案'}｜{POC_BRANDING_COPY}",
         "contents": bubble,
     }
 
@@ -481,6 +488,7 @@ def help_text() -> str:
         "・「希望休 A 土」→ スタッフ枠を指定して希望休登録\n"
         "・「ヘルプ」→ この案内\n"
         "\n"
+        f"{POC_BRANDING_COPY}\n"
         "※ 販売時はお客様の LINE 公式アカウントを使います。"
         "開発者個人 LINE は不要です。\n"
         "※ デモ／未設定時は実 LINE には送らず、ログと定型返信のみです。\n"
@@ -491,7 +499,7 @@ def help_text() -> str:
 def canned_follow_reply() -> str:
     return (
         "友だち追加ありがとうございます。\n"
-        "店舗シフト PoC（OpenQARP 試作）です。\n"
+        f"{POC_BRANDING_COPY}\n"
         "まず店長から受け取った店舗コードで\n"
         "「登録 ○○○○」または「登録 ○○○○ 太郎」と送ってください。\n"
         "表示名は後から「名前 太郎」でも設定できます。\n"

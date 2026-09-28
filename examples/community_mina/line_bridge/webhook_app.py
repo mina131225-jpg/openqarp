@@ -51,6 +51,7 @@ from shift_messages import (  # noqa: E402
     get_line_credentials,
     help_text,
     need_register_text,
+    POC_BRANDING_COPY,
     parse_user_intent,
     run_shift_for_line,
     scenario_for_store,
@@ -112,7 +113,8 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
             body = (
                 f"{note}\n"
                 f"店舗ID: {store['store_id']}\n"
-                f"これで「希望休 日曜」「シフト見せて」が使えます。"
+                f"これで「希望休 日曜」「シフト見せて」が使えます。\n"
+                f"{POC_BRANDING_COPY}"
             )
         else:
             body = note
@@ -130,6 +132,8 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
         ok, note, store = set_member_display_name(
             user_id, intent.get("display_name") or ""
         )
+        if ok:
+            note = f"{note}\n{POC_BRANDING_COPY}"
         return [{"type": "text", "text": note}]
 
     if kind == "set_name_incomplete":
@@ -213,9 +217,9 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
 
     sc, store = _scenario_for_user(user_id)
     result = run_shift_for_line(sc)
-    header = "今週のシフト案です。"
+    header = f"今週のシフト案です。\n{POC_BRANDING_COPY}"
     if store:
-        header = f"「{store['store_name']}」の今週のシフト案です。"
+        header = f"「{store['store_name']}」の今週のシフト案です。\n{POC_BRANDING_COPY}"
     return [
         {"type": "text", "text": header},
         build_shift_flex(result),
