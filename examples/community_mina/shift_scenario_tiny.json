@@ -1,0 +1,14 @@
+{
+  "workers": ["A", "B", "C", "D"],
+  "days": ["月", "火", "水", "木", "金", "土", "日"],
+  "min_staff_per_day": 2,
+  "max_consecutive_days": 4,
+  "preferred_offs": {
+    "A": ["日"],
+    "B": ["土"],
+    "C": ["水"],
+    "D": ["月", "日"]
+  },
+  "qaoa_focus_day": "日",
+  "qaoa_needed_on_focus": 2
+}
