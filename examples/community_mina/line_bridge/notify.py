@@ -227,6 +227,76 @@ def reply_messages(
     }
 
 
+def broadcast_to_store(
+    store: dict,
+    messages: list[dict[str, Any]] | None = None,
+    *,
+    result: dict[str, Any] | None = None,
+    use_flex: bool = True,
+    extra_text: str | None = None,
+    dry_run: bool | None = None,
+) -> dict[str, Any]:
+    """店舗の全 line_user_ids へプッシュ（デモ時はペイロード列挙のみ）。
+
+    戻り値: {ok, mode, targets, results, sent_count, detail}
+    """
+    uids = list(store.get("line_user_ids") or [])
+    store_name = store.get("store_name") or store.get("store_id") or "(store)"
+    msgs = messages if messages is not None else build_messages(
+        result, use_flex=use_flex, extra_text=extra_text
+    )
+    if not uids:
+        LOG.info("[DEMO/MOCK broadcast] store=%s no members", store_name)
+        return {
+            "ok": True,
+            "mode": "demo",
+            "targets": [],
+            "results": [],
+            "sent_count": 0,
+            "detail": f"「{store_name}」に登録メンバーがいません（プレビューのみ）。",
+            "messages": msgs,
+        }
+
+    results = []
+    sent_count = 0
+    modes = set()
+    for uid in uids:
+        out = push_messages(
+            user_id=uid,
+            messages=msgs,
+            dry_run=dry_run,
+        )
+        modes.add(out.get("mode") or "demo")
+        if out.get("sent"):
+            sent_count += 1
+        results.append(
+            {
+                "user_id": uid,
+                "ok": out.get("ok"),
+                "sent": out.get("sent"),
+                "mode": out.get("mode"),
+                "detail": out.get("detail"),
+            }
+        )
+
+    mode = "live" if modes == {"live"} else ("demo" if "demo" in modes else "mixed")
+    detail = (
+        f"「{store_name}」へ {len(uids)} 名中 {sent_count} 名に送信"
+        if mode == "live"
+        else f"「{store_name}」へ {len(uids)} 名分のブロードキャストをデモ生成（実送信なし）"
+    )
+    return {
+        "ok": True,
+        "mode": mode,
+        "targets": uids,
+        "results": results,
+        "sent_count": sent_count,
+        "detail": detail,
+        "messages": msgs,
+    }
+
+
+
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(
         level=logging.INFO,

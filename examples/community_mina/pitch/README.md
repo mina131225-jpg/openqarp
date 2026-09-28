@@ -16,7 +16,7 @@
 | `PITCH.md` | ワンページ・ピッチ（UI 下部にも表示） |
 | `SELLER_SCRIPT.md` | 店舗オーナーへの実トーク原稿 |
 | `requirements.txt` | UI 用追加依存（streamlit, pandas） |
-| `../line_bridge/` | LINE Messaging API ブリッジ（webhook・notify・日本語手順） |
+| `../line_bridge/` | LINE ブリッジ（マルチテナント店舗登録・webhook・notify・日本語手順） |
 
 ## 起動方法
 
@@ -53,8 +53,9 @@ print('score', r['classical']['score'], 'qarp', r['qarp_ok'], 'q_ok', r['quantum
 3. 提案サマリー・週次表・希望休バッジ・スコアを見せる。  
 4. Before/After と「古典 vs 量子」で OpenQARP QAOA の一致バッジを指す。  
 5. 必ず言う: **本体は古典。量子は比較・将来拡張。勝ち主張しない。SaaS 置き換えではない。**  
-6. **LINE連携**でステータス（未設定／デモモード）と「LINE向けメッセージを生成」プレビューを見せる。  
-   ライブ送信は主張しない（資格情報があるときだけテスト送信可）。  
+6. **店舗向け**で招待コード／QRプレースホルダとマスク済みメンバーを見せる。  
+   **LINE連携**でステータスとメッセージプレビューを見せる（ライブ送信は主張しない）。  
+   販売時はお客様の LINE 公式を使い、開発者個人 LINE は不要、と明言する。  
 7. 詳細トークは `SELLER_SCRIPT.md`（先頭の15秒フックから）をそのまま読む。
 
 ## 価格感・次の一歩（仮）
@@ -70,4 +71,4 @@ print('score', r['classical']['score'], 'qarp', r['qarp_ok'], 'q_ok', r['quantum
 
 - `QARP_SKIP_ABI_CHECK=1` は、公式以外のビルド／別ツリーの venv 共有時の回避策です。通常の `pip install -e .` では不要なことが多いです。  
 - qarp が import できない場合、UI は古典のみで動作し、量子パネルに理由を表示します。  
-- LINE 実送信には Channel secret / token / userId が必要です。未設定時はデモ／プレビューのみ（`line_bridge/README.md`）。
+- LINE 実送信には **お客様側** の Channel secret / token が必要です。未設定時はデモ／プレビューのみ（`line_bridge/README.md`）。開発者個人 LINE は不要。

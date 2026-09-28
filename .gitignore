@@ -66,3 +66,8 @@ cpp/libqarpx/build*/
 
 # competitor benchmark raw results (host-specific; only the generated docs are committed)
 benchmarks/results/
+
+# LINE bridge local store registry / secrets
+examples/community_mina/line_bridge/stores.json
+examples/community_mina/line_bridge/.env
+examples/community_mina/line_bridge/stores.json.tmp

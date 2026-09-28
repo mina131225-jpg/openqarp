@@ -1,46 +1,70 @@
-# LINE 連携ブリッジ（店舗シフト PoC）
+# LINE 連携ブリッジ（店舗シフト PoC・マルチテナント）
 
 OpenQARP コミュニティの **店舗シフト PoC** 向けに、LINE Messaging API へつなぐ薄い層です。
 
-- スタッフが LINE で「希望休 日曜」「シフト見せて」と送る → 古典ソルバで組表 → 返信
-- 店長側から週次表をプッシュ（Flex Message / テキスト）
-- **Channel secret / token が無いときはデモ／モックモード**（ペイロードをログし、定型返信のみ。実 LINE には送りません）
+## 販売時の前提（重要）
 
-> このディレクトリ単体では「ライブ LINE が動く」ことは保証しません。  
-> 実送受信は、あなたが LINE Developers でチャネルを作り、資格情報を入れた場合のみです。
+| 使うもの | 使わないもの |
+|----------|--------------|
+| **お客様（店舗）の LINE 公式アカウント** | 開発者個人の LINE アカウント |
+| 店長が発行する **店舗コード（招待コード）** | 開発者の userId 固定 |
+| スタッフが公式を友だち追加 →「登録 店舗コード」 | 開発者が一人ずつ手登録 |
+
+**開発者個人 LINE は不要です。**  
+販売・導入時は、店舗オーナー側で LINE Developers に Messaging API チャネルを作り、Channel secret / token を設定します。スタッフは公式アカウントを友だち追加し、店長から受け取ったコードで登録します。
 
 Credit: Powered by OpenQARP
 
 ---
 
-## 1. LINE Messaging API チャネルの作り方
+## 店舗オンボーディングの流れ
 
-1. [LINE Developers](https://developers.line.biz/console/) にログインする  
+```
+店長（Streamlit「店舗向け」）
+  │  店舗を作成 → 招待コード／QRプレースホルダ URL を配布
+  ▼
+スタッフ
+  │  お客様の LINE 公式を友だち追加
+  │  「登録 MINA01」  ← 店舗コードで userId を紐付け
+  ▼
+日常
+  │  「希望休 日曜」→ その店舗のシナリオに反映して再組表
+  │  「シフト見せて」→ その店舗の週次表を返信
+  ▼
+店長
+     組表生成 → 登録メンバー全員へブロードキャスト（デモ可）
+```
+
+店舗データは `stores.json`（または `LINE_STORES_PATH`）に保存されます。
+
+| フィールド | 内容 |
+|------------|------|
+| `store_id` | 内部 ID（例: `store_a1b2c3d4`） |
+| `store_name` | 表示名 |
+| `invite_code` | 招待コード（例: `DEMO01`） |
+| `line_user_ids[]` | 登録済みスタッフの LINE userId |
+| `preferences` | 希望休など店舗共有設定 |
+
+---
+
+## 1. LINE Messaging API チャネルの作り方（お客様側）
+
+1. [LINE Developers](https://developers.line.biz/console/) に **お客様（店舗）のアカウント** でログイン  
 2. プロバイダーを作成（または既存を選択）  
 3. **Messaging API チャネル**を新規作成  
-   - チャネル名: 例「店舗シフトPoC」  
-   - 業種・説明は任意  
-4. チャネル基本設定で次を控える  
-   - **Channel secret**  
-5. Messaging API 設定タブで  
-   - **チャネルアクセストークン（長期）** を発行して控える  
-   - Webhook URL を後述のとおり設定（ngrok 等で HTTPS 公開が必要）  
-   - 「Webhookの利用」をオン  
-   - 「応答メッセージ」「あいさつメッセージ」はオフ推奨（Bot が reply するため）  
-6. 友だち追加用の QR / リンクでテスト用 LINE アカウントを友だちにする  
-7. 友だち追加後、webhook の `follow` イベントやメッセージの `source.userId` から **userId** を取得する（プッシュ送信用）
+4. **Channel secret** と **チャネルアクセストークン（長期）** を控える  
+5. Webhook URL を設定（ngrok 等で HTTPS 公開）し、「Webhookの利用」をオン  
+6. 「応答メッセージ」「あいさつメッセージ」はオフ推奨  
+7. 友だち追加用 QR／リンクをスタッフに配布  
+
+> 開発者の個人 LINE で運用しないでください。販売先の公式を使います。
 
 ### Webhook URL の例
 
-ローカル開発では ngrok 等でトンネルします。
-
 ```bash
-# 別ターミナル
 ngrok http 8080
-# 表示された https://xxxx.ngrok-free.app/webhook を LINE コンソールの Webhook URL に設定
+# https://xxxx.ngrok-free.app/webhook を LINE コンソールへ
 ```
-
-検証ボタンで「成功」になれば OK です（本サーバは常に 200 を返します）。
 
 ---
 
@@ -50,29 +74,22 @@ ngrok http 8080
 
 ```bash
 cd examples/community_mina/line_bridge
-cp config.example.env .env   # .env は git 管理外想定
+cp config.example.env .env
 set -a && source .env && set +a
 ```
 
 | 変数 | 必須 | 説明 |
 |------|------|------|
-| `LINE_CHANNEL_SECRET` | 実運用時 | 署名検証用 |
+| `LINE_CHANNEL_SECRET` | 実運用時 | 署名検証用（**顧客の公式**） |
 | `LINE_CHANNEL_ACCESS_TOKEN` | 実運用時 | reply / push 用 |
-| `LINE_USER_ID` | プッシュ時 | 送信先ユーザー |
-| `LINE_DEMO_MODE` | 任意 | `true` で強制デモ（API 非呼び出し） |
+| `LINE_USER_ID` | 任意 | 単一宛先プッシュ用（マルチテナントでは店舗の `line_user_ids`） |
+| `LINE_DEMO_MODE` | 任意 | `true` で強制デモ |
+| `LINE_STORES_PATH` | 任意 | 店舗 JSON パス（既定 `stores.json`） |
+| `LINE_INVITE_BASE_URL` | 任意 | QR プレースホルダ用の友だち追加 URL ベース |
+| `LINE_REQUIRE_REGISTER` | 任意 | 未登録に希望休／シフトを拒否（既定 true） |
 | `LINE_WEBHOOK_HOST` / `PORT` | 任意 | 既定 `0.0.0.0:8080` |
-| `LINE_SCENARIO_JSON` | 任意 | シナリオ JSON パス |
 
-**未設定のまま起動 → ステータス「未設定」または「デモモード」。実送信しません。**
-
-Streamlit 側では `st.secrets`（例: `.streamlit/secrets.toml`）または同じ環境変数を読めます。
-
-```toml
-# .streamlit/secrets.toml の例（ローカルのみ・コミットしない）
-LINE_CHANNEL_SECRET = "..."
-LINE_CHANNEL_ACCESS_TOKEN = "..."
-LINE_USER_ID = "U..."
-```
+**未設定のまま起動 → デモモード。実送信しません。**
 
 ---
 
@@ -80,42 +97,58 @@ LINE_USER_ID = "U..."
 
 ```bash
 cd /path/to/openqarp
-source /path/to/venv/bin/activate   # 例: /workspace/openqarp-env
+source /path/to/venv/bin/activate
 export QARP_SKIP_ABI_CHECK=1
 
 python -m pip install -r examples/community_mina/line_bridge/requirements.txt
 
-# デモ（資格情報なし）
 export LINE_DEMO_MODE=true
 python examples/community_mina/line_bridge/webhook_app.py
 ```
 
-別ターミナルでモック送信:
+起動時にデモ店舗（招待コード `DEMO01`）が自動作成されます。
+
+### スモーク（デモモード）
 
 ```bash
-# テキスト意図 → メッセージ配列（ソルバ実行あり）
+# ① 登録
 curl -s -X POST http://127.0.0.1:8080/demo/message \
   -H 'Content-Type: application/json' \
-  -d '{"text":"シフト見せて","userId":"Udemo"}' | python -m json.tool
+  -d '{"text":"登録 DEMO01","userId":"Ustaff001"}' | python -m json.tool
 
-# webhook 形式のモック
+# ② 希望休
+curl -s -X POST http://127.0.0.1:8080/demo/message \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"希望休 日曜","userId":"Ustaff001"}' | python -m json.tool
+
+# ③ シフト見せて
+curl -s -X POST http://127.0.0.1:8080/demo/message \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"シフト見せて","userId":"Ustaff001"}' | python -m json.tool
+
+# 店舗一覧（userId マスク）
+curl -s http://127.0.0.1:8080/stores | python -m json.tool
+```
+
+webhook 形式:
+
+```bash
 curl -s -X POST http://127.0.0.1:8080/webhook \
   -H 'Content-Type: application/json' \
   -d '{
     "events": [{
       "type": "message",
       "replyToken": "demo-token",
-      "source": {"type": "user", "userId": "Udemo"},
-      "message": {"type": "text", "text": "希望休 日曜"}
+      "source": {"type": "user", "userId": "Ustaff002"},
+      "message": {"type": "text", "text": "登録 DEMO01"}
     }]
   }' | python -m json.tool
 ```
 
-プッシュ生成のみ（サーバ不要）:
+プッシュ／ブロードキャスト生成のみ:
 
 ```bash
 python examples/community_mina/line_bridge/notify.py --demo --flex
-python examples/community_mina/line_bridge/notify.py --demo --text
 ```
 
 ---
@@ -124,12 +157,14 @@ python examples/community_mina/line_bridge/notify.py --demo --text
 
 | ユーザー発話例 | 動作 |
 |----------------|------|
-| `シフト見せて` / `シフト表` | 今週のたたき台を Flex（＋短いテキスト）で返信 |
-| `希望休 日曜` / `希望休 日` | 先頭スタッフの希望休に「日」を追加して再組表 |
-| `希望休 A 土` | スタッフ A の希望休に「土」を追加して再組表 |
+| `登録 DEMO01` / `登録 店舗コード MINA01` | 店舗に userId を紐付け |
+| `シフト見せて` / `シフト表` | **所属店舗**のたたき台を Flex で返信 |
+| `希望休 日曜` / `希望休 A 土` | **所属店舗**のシナリオに希望休を反映して再組表 |
 | `ヘルプ` | 使い方 |
 
-本体の最適化は **古典ソルバ**（`shift_scheduling_demo` / `solver_bridge`）です。量子比較はこの LINE 層では送りません。
+未登録のまま希望休／シフトを送ると、登録を促すメッセージを返します。
+
+本体の最適化は **古典ソルバ** です。量子比較はこの LINE 層では送りません。
 
 ---
 
@@ -137,20 +172,22 @@ python examples/community_mina/line_bridge/notify.py --demo --text
 
 | ファイル | 内容 |
 |----------|------|
-| `webhook_app.py` | Flask webhook。署名検証・follow/message・デモエンドポイント |
-| `notify.py` | push / reply。デモ時は JSON をログ |
-| `shift_messages.py` | 意図パース・組表・テキスト／Flex 整形・接続ステータス |
+| `stores.py` | 店舗レジストリ（JSON）。作成・招待・登録・マスク表示 |
+| `stores.example.json` | 空のレジストリ雛形 |
+| `webhook_app.py` | Flask webhook。登録／希望休／組表・デモ API |
+| `notify.py` | push / reply / **broadcast_to_store** |
+| `shift_messages.py` | 意図パース・組表・テキスト／Flex・接続ステータス |
 | `config.example.env` | 環境変数テンプレ |
 | `requirements.txt` | flask, requests |
 
-ピッチ UI との接続は `../pitch/app.py` の「LINE連携」セクションを参照。
+Streamlit の「店舗向け」「LINE連携」は `../pitch/app.py` を参照。
 
 ---
 
 ## 6. 注意（必ず読む）
 
-- **ライブ LINE 動作を資格情報なしで主張しません。** デモモードは UI／営業説明用です。  
-- Channel secret / token / userId をリポジトリにコミットしないでください。  
-- 署名検証は secret 設定時のみ必須。デモ時はスキップして受理します（ローカル確認用）。  
-- ユーザー別希望休はプロセスメモリ保持のみ（再起動で消える PoC）。  
-- 労働法規・本格シフト SaaS の代替ではありません。
+- **ライブ LINE 動作を資格情報なしで主張しません。** デモは営業説明用です。  
+- **販売時は顧客の LINE 公式を使う。開発者個人 LINE は不要。**  
+- Channel secret / token / userId / `stores.json` をリポジトリにコミットしないでください。  
+- 署名検証は secret 設定時のみ必須。デモ時はスキップして受理します。  
+- PoC のため 1 userId = 1 店舗。労働法規・本格シフト SaaS の代替ではありません。

@@ -35,8 +35,8 @@ OpenQARP の基本的な回路実行と、QAOA による Max-Cut、およびそ�
   既定 dict と同じ内容です。`--scenario` で差し替えできます。
 - `pitch/` — **OpenQARPで試作した店舗シフトPoC** の営業デモ (Streamlit UI・ワンペーシ・売り手トーク)。
   本体は古典、比較に OpenQARP QAOA。起動は `pitch/README.md` を参照。
-- `line_bridge/` — LINE Messaging API 向けブリッジ（希望休→自動組表→通知の PoC）。
-  資格情報未設定時はデモ／モック。手順は `line_bridge/README.md`。
+- `line_bridge/` — LINE ブリッジ（マルチテナント店舗登録・希望休→組表→通知の PoC）。
+  販売時は顧客の LINE 公式を使用（開発者個人 LINE 不要）。デモ可。`line_bridge/README.md`。
 
 ## 実行方法
 

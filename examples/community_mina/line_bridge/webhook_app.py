@@ -1,20 +1,26 @@
 #!/usr/bin/env python3
-"""LINE Messaging API webhook（Flask）。
+"""LINE Messaging API webhook（Flask）— マルチテナント店舗向け。
+
+販売ストーリー:
+  店長が Streamlit「店舗向け」で店舗＋招待コードを発行
+  → スタッフがお客様の LINE 公式を友だち追加
+  → 「登録 <店舗コード>」で userId を店舗に紐付け
+  → 「希望休 …」「シフト見せて」は所属店舗のシナリオで動作
 
 機能:
   - X-Line-Signature 検証（Channel secret があるとき）
-  - follow / message イベント処理
-  - 「希望休 日曜」「シフト見せて」等に古典ソルバ結果で返信
+  - follow / message イベント処理（登録・希望休・組表）
   - トークン未設定時はデモ／モック: ペイロードをログし定型返信を返す
+  - 開発者個人 LINE は不要（顧客の公式アカウント想定）
 
 起動:
   cd examples/community_mina/line_bridge
-  export LINE_DEMO_MODE=true   # 資格情報なしで試す
+  export LINE_DEMO_MODE=true
   python webhook_app.py
 
-  curl -X POST http://127.0.0.1:8080/webhook \\
-    -H 'Content-Type: application/json' \\
-    -d '{"events":[{"type":"message","replyToken":"demo","source":{"userId":"Udemo"},"message":{"type":"text","text":"シフト見せて"}}]}'
+  curl -X POST http://127.0.0.1:8080/webhook \
+    -H 'Content-Type: application/json' \
+    -d '{"events":[{"type":"message","replyToken":"demo","source":{"userId":"Udemo"},"message":{"type":"text","text":"登録 DEMO01"}}]}'
 """
 
 from __future__ import annotations
@@ -44,17 +50,24 @@ from shift_messages import (  # noqa: E402
     connection_status,
     get_line_credentials,
     help_text,
-    load_base_scenario,
+    need_register_text,
     parse_user_intent,
     run_shift_for_line,
+    scenario_for_store,
+)
+from stores import (  # noqa: E402
+    ensure_demo_store,
+    get_store_for_user,
+    register_user,
+    set_store_preferred_offs,
 )
 
 LOG = logging.getLogger("line_bridge.webhook")
 
 app = Flask(__name__)
 
-# ユーザーごとの簡易希望休（プロセス内。PoC 用）
-_USER_SCENARIOS: dict[str, dict[str, Any]] = {}
+# 未登録ユーザー向けの一時シナリオ（プロセス内フォールバック）
+_ORPHAN_SCENARIOS: dict[str, dict[str, Any]] = {}
 
 
 def _verify_signature(body: bytes, signature: str | None, secret: str) -> bool:
@@ -67,31 +80,77 @@ def _verify_signature(body: bytes, signature: str | None, secret: str) -> bool:
     return hmac.compare_digest(expected, signature)
 
 
-def _scenario_for_user(user_id: str) -> dict[str, Any]:
-    if user_id not in _USER_SCENARIOS:
-        _USER_SCENARIOS[user_id] = load_base_scenario()
-    return _USER_SCENARIOS[user_id]
+def _scenario_for_user(user_id: str) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """戻り値: (scenario, store_or_none)。店舗があればその preferences を使う。"""
+    store = get_store_for_user(user_id)
+    if store:
+        return scenario_for_store(store), store
+    if user_id not in _ORPHAN_SCENARIOS:
+        _ORPHAN_SCENARIOS[user_id] = scenario_for_store(None)
+    return _ORPHAN_SCENARIOS[user_id], None
 
 
 def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
-    """テキスト意図 → LINE messages[]。"""
+    """テキスト意図 → LINE messages[]（店舗単位）。"""
     intent = parse_user_intent(text)
     kind = intent.get("intent")
+
+    if kind == "register":
+        # デモ店舗が無い環境でも「登録 DEMO01」が通るよう用意
+        if (intent.get("invite_code") or "").upper() == "DEMO01":
+            ensure_demo_store()
+        ok, note, store = register_user(user_id, intent.get("invite_code") or "")
+        if ok and store:
+            body = (
+                f"{note}\n"
+                f"店舗ID: {store['store_id']}\n"
+                f"これで「希望休 日曜」「シフト見せて」が使えます。"
+            )
+        else:
+            body = note
+        return [{"type": "text", "text": body}]
+
+    if kind == "register_incomplete":
+        return [
+            {
+                "type": "text",
+                "text": intent.get("hint", "") + "\n\n" + help_text(),
+            }
+        ]
 
     if kind == "help" or kind == "set_pref_incomplete":
         msg = help_text()
         if kind == "set_pref_incomplete":
             msg = intent.get("hint", "") + "\n\n" + msg
+        store = get_store_for_user(user_id)
+        if store:
+            msg = f"所属: {store['store_name']}（{store['invite_code']}）\n\n" + msg
+        else:
+            msg = need_register_text() + "\n\n" + msg
         return [{"type": "text", "text": msg}]
 
     if kind == "set_pref":
-        sc = _scenario_for_user(user_id)
+        store = get_store_for_user(user_id)
+        if store is None and os.environ.get("LINE_REQUIRE_REGISTER", "true").strip().lower() in {
+            "1", "true", "yes", "on",
+        }:
+            # デモでは未登録でも orphan シナリオで動かすオプション
+            if os.environ.get("LINE_ALLOW_ORPHAN", "").strip().lower() not in {
+                "1", "true", "yes", "on",
+            }:
+                return [{"type": "text", "text": need_register_text()}]
+
+        sc, store = _scenario_for_user(user_id)
         sc2, note = apply_pref_to_scenario(
             sc,
             worker=intent.get("worker"),
             day=intent.get("day"),
         )
-        _USER_SCENARIOS[user_id] = sc2
+        if store:
+            set_store_preferred_offs(store["store_id"], sc2.get("preferred_offs") or {})
+            note = f"[{store['store_name']}] {note}"
+        else:
+            _ORPHAN_SCENARIOS[user_id] = sc2
         result = run_shift_for_line(sc2)
         return [
             {"type": "text", "text": note},
@@ -99,10 +158,22 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
         ]
 
     # show_shift（既定）
-    sc = _scenario_for_user(user_id)
+    store = get_store_for_user(user_id)
+    if store is None and os.environ.get("LINE_REQUIRE_REGISTER", "true").strip().lower() in {
+        "1", "true", "yes", "on",
+    }:
+        if os.environ.get("LINE_ALLOW_ORPHAN", "").strip().lower() not in {
+            "1", "true", "yes", "on",
+        }:
+            return [{"type": "text", "text": need_register_text()}]
+
+    sc, store = _scenario_for_user(user_id)
     result = run_shift_for_line(sc)
+    header = "今週のシフトたたき台です。"
+    if store:
+        header = f"「{store['store_name']}」の今週のシフトたたき台です。"
     return [
-        {"type": "text", "text": "今週のシフトたたき台です。"},
+        {"type": "text", "text": header},
         build_shift_flex(result),
     ]
 
@@ -124,7 +195,10 @@ def process_event(event: dict[str, Any]) -> dict[str, Any] | None:
             messages = [
                 {
                     "type": "text",
-                    "text": "テキストで「シフト見せて」または「希望休 日曜」と送ってください。",
+                    "text": (
+                        "テキストで「登録 店舗コード」「シフト見せて」"
+                        "または「希望休 日曜」と送ってください。"
+                    ),
                 }
             ]
             return reply_messages(reply_token, messages)
@@ -145,10 +219,18 @@ def index():
         {
             "service": "openqarp-community-mina-line-bridge",
             "status": status,
-            "endpoints": {"webhook": "POST /webhook", "health": "GET /health"},
+            "multi_tenant": True,
+            "endpoints": {
+                "webhook": "POST /webhook",
+                "health": "GET /health",
+                "demo_message": "POST /demo/message",
+                "stores": "GET /stores",
+            },
             "note": (
+                "販売時は顧客の LINE 公式を使う想定です。"
+                "スタッフは友だち追加後「登録 <店舗コード>」で紐付け。"
+                "開発者個人 LINE は不要。"
                 "資格情報未設定時はデモモードです。"
-                "実 LINE への送受信は Channel secret/token 設定後のみ。"
             ),
         }
     )
@@ -156,7 +238,29 @@ def index():
 
 @app.get("/health")
 def health():
-    return jsonify({"ok": True, "status": connection_status()})
+    return jsonify({"ok": True, "status": connection_status(), "multi_tenant": True})
+
+
+@app.get("/stores")
+def stores_list():
+    """デモ用: 店舗概要（userId はマスク）。"""
+    from stores import list_stores, mask_user_id, member_rows_masked
+
+    out = []
+    for s in list_stores():
+        out.append(
+            {
+                "store_id": s["store_id"],
+                "store_name": s["store_name"],
+                "invite_code": s["invite_code"],
+                "member_count": len(s.get("line_user_ids") or []),
+                "members_masked": member_rows_masked(s),
+                "line_user_ids_masked": [
+                    mask_user_id(u) for u in (s.get("line_user_ids") or [])
+                ],
+            }
+        )
+    return jsonify({"ok": True, "stores": out})
 
 
 @app.post("/webhook")
@@ -167,7 +271,6 @@ def webhook():
     status = connection_status(creds)
     secret = creds.get("channel_secret") or ""
 
-    # 署名検証: secret があるときだけ必須。デモ／未設定はスキップして受理。
     if secret:
         if not _verify_signature(body, signature, secret):
             LOG.warning("invalid signature")
@@ -203,7 +306,6 @@ def webhook():
                 }
             )
 
-    # LINE プラットフォームへは常に 200 を返す（検証・再送回避）
     return jsonify(
         {
             "ok": True,
@@ -217,17 +319,19 @@ def webhook():
 
 @app.post("/demo/message")
 def demo_message():
-    """資格情報なしのローカル確認用。本文 JSON: {"text":"シフト見せて","userId":"Udemo"}"""
+    """資格情報なしのローカル確認用。
+
+    JSON: {"text":"登録 DEMO01","userId":"Udemo"}
+    """
     data = request.get_json(silent=True) or {}
     text = data.get("text") or "シフト見せて"
     user_id = data.get("userId") or "Udemo"
     messages = handle_text_message(user_id, text)
-    # プレビュー用にテキスト版も付ける
     preview_text = None
+    store = get_store_for_user(user_id)
     for m in messages:
         if m.get("type") == "flex":
-            # 同じシナリオでテキストも生成
-            sc = _scenario_for_user(user_id)
+            sc, _ = _scenario_for_user(user_id)
             preview_text = build_shift_text(run_shift_for_line(sc))
             break
         if m.get("type") == "text" and preview_text is None:
@@ -237,6 +341,15 @@ def demo_message():
             "ok": True,
             "status": connection_status(),
             "input": {"text": text, "userId": user_id},
+            "store": (
+                {
+                    "store_id": store["store_id"],
+                    "store_name": store["store_name"],
+                    "invite_code": store["invite_code"],
+                }
+                if store
+                else None
+            ),
             "messages": messages,
             "preview_text": preview_text,
         }
@@ -248,6 +361,11 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    # デモ店舗を用意（販売デモですぐ「登録 DEMO01」できるように）
+    try:
+        ensure_demo_store()
+    except Exception as exc:  # noqa: BLE001
+        LOG.warning("ensure_demo_store failed: %s", exc)
     host = os.environ.get("LINE_WEBHOOK_HOST", "0.0.0.0")
     port = int(os.environ.get("LINE_WEBHOOK_PORT", "8080"))
     status = connection_status()
@@ -256,6 +374,7 @@ def main() -> None:
         LOG.info(
             "デモ／モックモードです。実 LINE には接続していません。"
             " LINE_CHANNEL_SECRET / LINE_CHANNEL_ACCESS_TOKEN を設定してください。"
+            " 販売時は顧客の公式アカウントを使用（開発者個人 LINE 不要）。"
         )
     app.run(host=host, port=port, debug=False)
 

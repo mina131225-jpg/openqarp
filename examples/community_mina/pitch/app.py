@@ -37,10 +37,12 @@ try:
         _sys.path.insert(0, str(LINE_BRIDGE))
     import notify as line_notify  # type: ignore
     import shift_messages as line_msgs  # type: ignore
+    import stores as line_stores  # type: ignore
 except Exception as _exc:  # noqa: BLE001
     _LINE_IMPORT_ERROR = _exc
     line_notify = None  # type: ignore
     line_msgs = None  # type: ignore
+    line_stores = None  # type: ignore
 
 st.set_page_config(
     page_title="OpenQARPで試作した店舗シフトPoC",
@@ -416,6 +418,179 @@ def _line_creds_from_ui(
     }
 
 
+def render_store_section(result: dict | None) -> None:
+    """店舗オーナー／スタッフ向けオンボーディング（マルチテナント）。"""
+    st.subheader("店舗向け（マルチテナント登録）")
+    st.caption(
+        "販売先は店舗オーナー／スタッフです。お客様の LINE 公式を使い、"
+        "店長が招待コードを発行 → スタッフが「登録 店舗コード」で紐付けます。"
+        "開発者個人 LINE は不要です。"
+    )
+
+    if line_stores is None or line_msgs is None or line_notify is None:
+        st.warning(
+            "line_bridge（stores）を読み込めませんでした: "
+            + str(_LINE_IMPORT_ERROR)
+        )
+        return
+
+    # デモ店舗を用意
+    try:
+        line_stores.ensure_demo_store()
+    except Exception as exc:  # noqa: BLE001
+        st.caption(f"デモ店舗の準備をスキップ: {exc}")
+
+    with st.expander("店舗を作成", expanded=True):
+        c1, c2 = st.columns([2, 1])
+        with c1:
+            new_name = st.text_input(
+                "店舗名",
+                value="サンプルカフェ",
+                key="store_new_name",
+            )
+        with c2:
+            custom_code = st.text_input(
+                "招待コード（空欄で自動）",
+                value="",
+                key="store_new_code",
+                help="英数字 3〜16 文字。空なら自動生成。",
+            )
+        if st.button("店舗を作成", type="primary", key="store_create_btn"):
+            try:
+                rec = line_stores.create_store(
+                    new_name,
+                    invite_code=custom_code.strip() or None,
+                )
+                st.session_state["store_last_created"] = rec
+                st.success(
+                    f"作成しました: {rec['store_name']} ／ コード {rec['invite_code']}"
+                )
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"作成エラー: {exc}")
+
+    stores = line_stores.list_stores()
+    if not stores:
+        st.info(
+            "まだ店舗がありません。「店舗を作成」するか、デモコード DEMO01 を使えます。"
+        )
+        return
+
+    names = {
+        f"{s['store_name']}（{s['invite_code']}）": s["store_id"] for s in stores
+    }
+    pick = st.selectbox("操作する店舗", list(names.keys()), key="store_pick")
+    sid = names[pick]
+    store = line_stores.get_store(sid) or next(
+        s for s in stores if s["store_id"] == sid
+    )
+
+    invite_url = line_stores.invite_url_placeholder(store["invite_code"])
+    m1, m2, m3 = st.columns(3)
+    with m1:
+        st.metric("招待コード", store["invite_code"])
+    with m2:
+        st.metric("登録メンバー", len(store.get("line_user_ids") or []))
+    with m3:
+        st.metric("store_id", store["store_id"][:12] + "…")
+
+    st.markdown("**招待リンク（QR プレースホルダ）**")
+    st.code(invite_url, language=None)
+    st.caption(
+        "本番では LINE 公式の友だち追加 URL に差し替え、スタッフへコードを案内してください。"
+        " スタッフは友だち追加後、チャットで「登録 "
+        + store["invite_code"]
+        + "」と送ります。"
+    )
+
+    st.markdown("**登録メンバー（userId マスク）**")
+    rows = line_stores.member_rows_masked(store)
+    if rows:
+        st.dataframe(rows, hide_index=True, width="stretch")
+    else:
+        st.caption(
+            "まだメンバーがいません。デモでは webhook で「登録 "
+            + store["invite_code"]
+            + "」を送ると追加されます。"
+        )
+
+    st.markdown("**シフト生成 → メンバーへブロードキャスト（プレビュー）**")
+    use_flex = st.checkbox("Flex Message で送る", value=True, key="store_bc_flex")
+    force_demo = st.checkbox(
+        "デモモードでプレビューのみ（実送信しない）",
+        value=True,
+        key="store_bc_demo",
+        help="営業デモではオン推奨。トークンが無くてもプレビューできます。",
+    )
+    if st.button(
+        "組表して全員へブロードキャストプレビュー",
+        key="store_bc_btn",
+        use_container_width=True,
+    ):
+        from solver_bridge import run_classical_week
+
+        if result is not None:
+            sc = dict(result["scenario"])
+            classical = result["classical"]
+            prefs = (store.get("preferences") or {}).get("preferred_offs")
+            if prefs:
+                sc = dict(sc)
+                sc["preferred_offs"] = prefs
+                classical = run_classical_week(sc)
+            line_result = {"scenario": sc, "classical": classical}
+        else:
+            sc = line_msgs.scenario_for_store(store)
+            classical = run_classical_week(sc)
+            line_result = {"scenario": sc, "classical": classical}
+
+        extra = f"【{store['store_name']}】今週のシフトたたき台です（PoC）。"
+        if force_demo:
+            import os as _os
+
+            _os.environ["LINE_DEMO_MODE"] = "true"
+        out = line_notify.broadcast_to_store(
+            store,
+            result=line_result,
+            use_flex=use_flex,
+            extra_text=extra,
+            dry_run=True if force_demo else None,
+        )
+        st.session_state["store_bc_preview"] = {
+            "detail": out.get("detail"),
+            "mode": out.get("mode"),
+            "sent_count": out.get("sent_count"),
+            "targets_masked": [
+                line_stores.mask_user_id(u) for u in (out.get("targets") or [])
+            ],
+            "text": line_msgs.build_shift_text(line_result),
+            "messages": out.get("messages"),
+        }
+
+    bc = st.session_state.get("store_bc_preview")
+    if bc:
+        st.info(bc["detail"] + f" ／ mode={bc['mode']} ／ sent={bc['sent_count']}")
+        if bc["targets_masked"]:
+            st.caption("宛先（マスク）: " + ", ".join(bc["targets_masked"]))
+        st.code(bc["text"], language=None)
+        with st.expander("ブロードキャスト messages JSON"):
+            import json as _json
+
+            st.code(
+                _json.dumps(bc["messages"], ensure_ascii=False, indent=2),
+                language="json",
+            )
+
+    st.markdown(
+        """
+<div class="product-note">
+  <b>売り文句</b>：御店の LINE 公式にスタッフが友だち追加 →「登録 店舗コード」→
+  希望休／シフトが店舗単位で動く。開発者の個人 LINE は使いません。
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+
+
 def render_line_section(result: dict | None) -> None:
     """営業デモ用 LINE 連携セクション。実送信は資格情報があるときのみ。"""
     st.subheader("LINE連携")
@@ -592,9 +767,11 @@ def render_line_section(result: dict | None) -> None:
     st.markdown(
         """
 <div class="product-note">
-  <b>売り文句の核</b>：LINEで希望休 → 自動組表 → 通知。
-  Webhook 実装は <code>examples/community_mina/line_bridge/</code>。
-  ライブ動作はユーザー自身の LINE 資格情報が必要です。
+  <b>売り文句の核</b>：御店の LINE 公式で希望休 → 自動組表 → 通知。
+  スタッフは「登録 店舗コード」で紐付け（マルチテナント）。
+  開発者個人 LINE は不要。Webhook は
+  <code>examples/community_mina/line_bridge/</code>。
+  ライブ動作は<strong>お客様側</strong>の Channel secret / token が必要です。
 </div>
 """,
         unsafe_allow_html=True,
@@ -1050,7 +1227,9 @@ else:
         unsafe_allow_html=True,
     )
 
-# ---- LINE 連携 ----
+# ---- 店舗向け（マルチテナント）＋ LINE 連携 ----
+st.divider()
+render_store_section(result)
 st.divider()
 render_line_section(result)
 

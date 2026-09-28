@@ -130,6 +130,7 @@ def parse_user_intent(text: str) -> dict[str, Any]:
     """LINE テキストから意図を抽出。
 
     例:
+      「登録 MINA01」「登録 店舗コード DEMO01」→ register
       「シフト見せて」「シフト表」→ show_shift
       「希望休 日曜」「希望休 A 土」→ set_pref
       その他 → help
@@ -137,6 +138,30 @@ def parse_user_intent(text: str) -> dict[str, Any]:
     raw = (text or "").strip()
     normalized = raw.replace("　", " ")
     lower_hint = normalized
+
+    # 登録 <店舗コード>
+    m_reg = re.search(
+        r"^(?:登録|バインド|紐付[けけ]?)"
+        r"(?:\s*店舗(?:コード|ID)?)?"
+        r"\s*(?:[:：]\s*)?"
+        r"(?P<code>[A-Za-z0-9]{3,16})\s*$",
+        normalized,
+        re.I,
+    )
+    if m_reg:
+        return {
+            "intent": "register",
+            "raw": raw,
+            "invite_code": m_reg.group("code").upper(),
+        }
+    if re.search(r"^(?:登録|バインド)\s*$", normalized) or re.search(
+        r"^(?:登録|バインド)\s+店舗", normalized
+    ):
+        return {
+            "intent": "register_incomplete",
+            "raw": raw,
+            "hint": "例: 「登録 DEMO01」（店長から受け取った店舗コード）",
+        }
 
     if re.search(r"シフト|組表|スケジュール", lower_hint) and not re.search(
         r"希望休", lower_hint
@@ -398,11 +423,14 @@ def build_shift_flex(result: dict[str, Any], *, alt_text: str | None = None) -> 
 def help_text() -> str:
     return (
         "【使い方】\n"
-        "・「シフト見せて」→ 今週のたたき台を返信\n"
-        "・「希望休 日曜」→ 先頭スタッフの希望休を登録して再組表\n"
+        "・「登録 DEMO01」→ 店長の店舗コードでスタッフ登録\n"
+        "・「シフト見せて」→ 所属店舗の今週たたき台を返信\n"
+        "・「希望休 日曜」→ 店舗シナリオに希望休を反映して再組表\n"
         "・「希望休 A 土」→ スタッフ指定で希望休登録\n"
         "・「ヘルプ」→ この案内\n"
         "\n"
+        "※ 販売時はお客様の LINE 公式アカウントを使います。"
+        "開発者個人 LINE は不要です。\n"
         "※ デモ／未設定時は実 LINE には送らず、ログと定型返信のみです。\n"
         "Credit: Powered by OpenQARP"
     )
@@ -412,6 +440,34 @@ def canned_follow_reply() -> str:
     return (
         "友だち追加ありがとうございます。\n"
         "店舗シフト PoC（OpenQARP 試作）です。\n"
-        "「シフト見せて」または「希望休 日曜」と送ってみてください。\n"
-        "（資格情報未設定時はデモ返信のみ）"
+        "まず店長から受け取った店舗コードで\n"
+        "「登録 ○○○○」と送ってください。\n"
+        "その後「シフト見せて」「希望休 日曜」が使えます。\n"
+        "（資格情報未設定時はデモ返信のみ／開発者個人 LINE は不要）"
     )
+
+
+def need_register_text() -> str:
+    return (
+        "まだ店舗に登録されていません。\n"
+        "店長から受け取った店舗コードで\n"
+        "「登録 ○○○○」と送ってください。\n"
+        "例: 「登録 DEMO01」"
+    )
+
+
+def scenario_for_store(store: dict[str, Any] | None) -> dict[str, Any]:
+    """店舗の preferences をベースシナリオに重ねた週次シナリオを返す。"""
+    sc = load_base_scenario()
+    if not store:
+        return sc
+    override = store.get("scenario_override")
+    if isinstance(override, dict) and override.get("workers"):
+        sc = deepcopy(override)
+    prefs = store.get("preferences") or {}
+    preferred = prefs.get("preferred_offs")
+    if isinstance(preferred, dict):
+        sc["preferred_offs"] = {
+            w: list(v) for w, v in preferred.items()
+        }
+    return sc
