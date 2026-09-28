@@ -33,6 +33,8 @@ OpenQARP の基本的な回路実行と、QAOA による Max-Cut、およびそ�
   縮小版を Max-Cut / QAOA に対応付けて並べて表示します。
 - `shift_scenario_tiny.json` — シフトデモ用のシナリオ例 (JSON)。スクリプト内の
   既定 dict と同じ内容です。`--scenario` で差し替えできます。
+- `pitch/` — **OpenQARPで試作した店舗シフトPoC** の営業デモ (Streamlit UI・ワンペーシ・売り手トーク)。
+  本体は古典、比較に OpenQARP QAOA。起動は `pitch/README.md` を参照。
 
 ## 実行方法
 
@@ -49,6 +51,10 @@ python -m pip install -e .
 python examples/community_mina/bell_sampler.py
 python examples/community_mina/classical_vs_qaoa_maxcut.py
 python examples/community_mina/shift_scheduling_demo.py
+
+# 営業向け UI (streamlit / pandas が必要)
+python -m pip install -r examples/community_mina/pitch/requirements.txt
+streamlit run examples/community_mina/pitch/app.py
 ```
 
 ショット数やシード、シナリオ JSON は変更できます。

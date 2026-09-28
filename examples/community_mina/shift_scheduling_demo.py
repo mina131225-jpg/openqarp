@@ -25,9 +25,32 @@ os.environ.setdefault("QARP_SKIP_ABI_CHECK", "1")
 
 import networkx as nx
 
-from qarp import config
-from qarp.algorithms import QAOA, Sampler
-from qarp.engines import QarpEngine
+# qarp は QAOA パスでのみ必要。欠落時は古典ソルバだけ動かす。
+_QARP_IMPORT_ERROR: Exception | None = None
+
+
+def _ensure_qarp():
+    """遅延 import。失敗時は RuntimeError を投げる。"""
+    global _QARP_IMPORT_ERROR
+    try:
+        from qarp import config
+        from qarp.algorithms import QAOA, Sampler
+        from qarp.engines import QarpEngine
+        return config, QAOA, Sampler, QarpEngine
+    except Exception as exc:  # noqa: BLE001 — デモ用に広く捕捉
+        _QARP_IMPORT_ERROR = exc
+        raise RuntimeError(
+            f"qarp を import できません ({exc}). "
+            "古典ソルバのみ利用可能です。QARP_SKIP_ABI_CHECK=1 も確認してください。"
+        ) from exc
+
+
+def qarp_available() -> bool:
+    try:
+        _ensure_qarp()
+        return True
+    except RuntimeError:
+        return False
 
 # ---------------------------------------------------------------------------
 # 既定シナリオ: 4 人 × 7 日の小さな店舗
@@ -356,6 +379,7 @@ def qaoa_maxcut(
     seed: int,
 ) -> tuple[float, list, list[tuple[str, int]], float, list[str], float]:
     started = perf_counter()
+    config, QAOA, Sampler, QarpEngine = _ensure_qarp()
     config.seed = seed
     qaoa = QAOA(
         problem=graph,
