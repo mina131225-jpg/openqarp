@@ -31,36 +31,60 @@ st.set_page_config(
     page_title="OpenQARPで試作した店舗シフトPoC",
     page_icon="🗓️",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
 
-# ---- スタイル ----
+# ---- スタイル（モバイル読みやすさ重視） ----
 st.markdown(
     """
 <style>
+  .block-container {
+    padding-top: 1.1rem !important;
+    padding-bottom: 2rem !important;
+    max-width: 1100px;
+  }
   .hero-wrap {
     background: linear-gradient(135deg, #0f172a 0%, #1e3a5f 55%, #1d4ed8 100%);
-    border-radius: 1rem; padding: 1.35rem 1.5rem 1.2rem; margin-bottom: 1rem;
+    border-radius: 1rem; padding: 1.25rem 1.35rem 1.15rem; margin-bottom: 0.85rem;
     color: #f8fafc; box-shadow: 0 8px 24px rgba(15, 23, 42, 0.18);
   }
   .hero-kicker {
-    font-size: 0.78rem; letter-spacing: 0.06em; text-transform: uppercase;
-    color: #93c5fd; font-weight: 600; margin-bottom: 0.35rem;
+    font-size: 0.72rem; letter-spacing: 0.06em; text-transform: uppercase;
+    color: #93c5fd; font-weight: 600; margin-bottom: 0.3rem;
   }
   .hero-title {
-    font-size: 1.85rem; font-weight: 800; line-height: 1.25; margin: 0 0 0.45rem;
+    font-size: clamp(1.35rem, 4.5vw, 1.85rem); font-weight: 800;
+    line-height: 1.3; margin: 0 0 0.4rem;
   }
-  .hero-sub { color: #cbd5e1; font-size: 0.98rem; margin: 0; }
+  .hero-sub { color: #cbd5e1; font-size: 0.95rem; margin: 0; line-height: 1.55; }
   .value-grid {
-    display: grid; grid-template-columns: repeat(3, 1fr); gap: 0.75rem;
-    margin: 0.85rem 0 0.35rem;
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 0.65rem;
+    margin: 0.7rem 0 0.25rem;
   }
   .value-card {
     background: #ffffff; border: 1px solid #e2e8f0; border-radius: 0.75rem;
-    padding: 0.85rem 1rem; box-shadow: 0 1px 2px rgba(15,23,42,0.04);
+    padding: 0.75rem 0.9rem; box-shadow: 0 1px 2px rgba(15,23,42,0.04);
   }
-  .value-card b { display: block; color: #0f172a; font-size: 0.98rem; margin-bottom: 0.25rem; }
-  .value-card span { color: #475569; font-size: 0.88rem; line-height: 1.45; }
+  .value-card b { display: block; color: #0f172a; font-size: 0.95rem; margin-bottom: 0.2rem; }
+  .value-card span { color: #475569; font-size: 0.86rem; line-height: 1.45; }
+  .ba-grid {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem;
+    margin: 0.55rem 0 0.85rem;
+  }
+  .ba-card {
+    border-radius: 0.75rem; padding: 0.85rem 1rem; min-height: 7.2rem;
+  }
+  .ba-before { background: #fff7ed; border: 1px solid #fed7aa; }
+  .ba-after { background: #eff6ff; border: 1px solid #bfdbfe; }
+  .ba-card h4 {
+    margin: 0 0 0.45rem; font-size: 0.92rem; font-weight: 800; line-height: 1.35;
+  }
+  .ba-before h4 { color: #9a3412; }
+  .ba-after h4 { color: #1e40af; }
+  .ba-card ul {
+    margin: 0; padding-left: 1.1rem; color: #334155;
+    font-size: 0.86rem; line-height: 1.55;
+  }
   .badge-ok {
     display: inline-block; background: #d1fae5; color: #065f46;
     padding: 0.18rem 0.65rem; border-radius: 999px; font-weight: 700; font-size: 0.85rem;
@@ -69,47 +93,100 @@ st.markdown(
     display: inline-block; background: #fee2e2; color: #991b1b;
     padding: 0.18rem 0.65rem; border-radius: 999px; font-weight: 700; font-size: 0.85rem;
   }
-  .badge-info {
-    display: inline-block; background: #e0e7ff; color: #3730a3;
-    padding: 0.18rem 0.65rem; border-radius: 999px; font-weight: 700; font-size: 0.85rem;
-  }
   .badge-soft {
     display: inline-block; background: #f1f5f9; color: #334155;
     padding: 0.18rem 0.65rem; border-radius: 999px; font-weight: 600; font-size: 0.82rem;
   }
   .disclaimer-box {
     background: #fffbeb; border-left: 4px solid #f59e0b;
-    padding: 0.85rem 1.05rem; border-radius: 0.45rem; margin: 0.35rem 0 1rem;
-    font-size: 0.92rem; color: #78350f;
+    padding: 0.75rem 0.95rem; border-radius: 0.45rem; margin: 0.25rem 0 0.85rem;
+    font-size: 0.9rem; color: #78350f; line-height: 1.5;
   }
   .product-note {
     background: #f0fdf4; border-left: 4px solid #22c55e;
-    padding: 0.7rem 1rem; border-radius: 0.45rem; margin: 0.5rem 0 1rem;
-    font-size: 0.9rem; color: #14532d;
+    padding: 0.65rem 0.95rem; border-radius: 0.45rem; margin: 0.45rem 0 0.85rem;
+    font-size: 0.88rem; color: #14532d; line-height: 1.5;
   }
   .metric-strip {
-    display: grid; grid-template-columns: repeat(4, 1fr); gap: 0.75rem;
-    margin: 0.5rem 0 1rem;
+    display: grid; grid-template-columns: repeat(4, 1fr); gap: 0.65rem;
+    margin: 0.45rem 0 0.85rem;
   }
   .metric-card {
     background: #f8fafc; border: 1px solid #e2e8f0;
-    border-radius: 0.75rem; padding: 0.85rem 1rem;
+    border-radius: 0.75rem; padding: 0.75rem 0.9rem;
   }
-  .metric-card .label { color: #64748b; font-size: 0.82rem; margin-bottom: 0.2rem; }
-  .metric-card .value { color: #0f172a; font-size: 1.45rem; font-weight: 800; line-height: 1.2; }
-  .metric-card .hint { color: #94a3b8; font-size: 0.78rem; margin-top: 0.2rem; }
+  .metric-card .label { color: #64748b; font-size: 0.8rem; margin-bottom: 0.15rem; }
+  .metric-card .value { color: #0f172a; font-size: 1.35rem; font-weight: 800; line-height: 1.2; }
+  .metric-card .hint { color: #94a3b8; font-size: 0.76rem; margin-top: 0.15rem; }
   .compare-card {
     background: #ffffff; border: 1px solid #e2e8f0; border-radius: 0.75rem;
-    padding: 0.9rem 1rem; min-height: 9.5rem;
+    padding: 0.85rem 0.95rem; min-height: 8.5rem;
   }
-  .compare-card h5 { margin: 0 0 0.55rem; font-size: 0.98rem; color: #1e293b; }
+  .compare-card h5 { margin: 0 0 0.5rem; font-size: 0.95rem; color: #1e293b; }
   .cta-box {
     background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 0.75rem;
-    padding: 0.95rem 1.1rem; margin: 0.75rem 0 0.25rem;
+    padding: 0.9rem 1rem; margin: 0.65rem 0 0.25rem; line-height: 1.55;
   }
-  div[data-testid="stDataFrame"] { font-size: 0.95rem; }
+  .oneclick-wrap {
+    background: #f8fafc; border: 1px dashed #cbd5e1; border-radius: 0.85rem;
+    padding: 0.95rem 1.05rem 1.05rem; margin: 0.2rem 0 0.75rem; text-align: center;
+  }
+  .oneclick-wrap .hint {
+    color: #64748b; font-size: 0.88rem; margin: 0.45rem 0 0; line-height: 1.45;
+  }
+  .proposal-card {
+    background: #ffffff;
+    border: 1px solid #cbd5e1;
+    border-radius: 0.5rem;
+    box-shadow: 0 2px 8px rgba(15, 23, 42, 0.06);
+    padding: 1.15rem 1.25rem 1.05rem;
+    margin: 0.35rem 0 1rem;
+    color: #0f172a;
+  }
+  .proposal-card .pc-head {
+    display: flex; justify-content: space-between; align-items: baseline;
+    border-bottom: 2px solid #0f172a; padding-bottom: 0.45rem; margin-bottom: 0.75rem;
+    gap: 0.5rem; flex-wrap: wrap;
+  }
+  .proposal-card .pc-title {
+    font-size: 1.15rem; font-weight: 800; letter-spacing: 0.02em; margin: 0;
+  }
+  .proposal-card .pc-sub {
+    font-size: 0.78rem; color: #64748b; font-weight: 600;
+  }
+  .proposal-card .pc-store {
+    font-size: 1.02rem; font-weight: 700; margin: 0 0 0.65rem; color: #1e3a5f;
+  }
+  .proposal-card .pc-section {
+    margin: 0.55rem 0 0.15rem; font-size: 0.82rem; font-weight: 800;
+    color: #334155; letter-spacing: 0.04em;
+  }
+  .proposal-card .pc-body {
+    font-size: 0.92rem; line-height: 1.6; color: #1e293b; margin: 0 0 0.35rem;
+  }
+  .proposal-card .pc-cta {
+    margin-top: 0.85rem; padding: 0.7rem 0.85rem;
+    background: #eff6ff; border: 1px solid #93c5fd; border-radius: 0.45rem;
+    font-size: 0.92rem; line-height: 1.55; color: #1e3a8a;
+  }
+  .proposal-card .pc-foot {
+    margin-top: 0.65rem; font-size: 0.76rem; color: #94a3b8; line-height: 1.45;
+  }
+  div[data-testid="stDataFrame"] { font-size: 0.92rem; }
+  div.stButton > button[kind="primary"],
+  div.stButton > button[data-testid="baseButton-primary"] {
+    font-size: 1.08rem !important;
+    font-weight: 700 !important;
+    padding: 0.65rem 1.2rem !important;
+    min-height: 3rem;
+  }
   @media (max-width: 900px) {
-    .value-grid, .metric-strip { grid-template-columns: 1fr; }
+    .value-grid, .metric-strip, .ba-grid { grid-template-columns: 1fr; }
+    .proposal-card { padding: 1rem 0.95rem; }
+    .hero-wrap { padding: 1.05rem 1.05rem 1rem; }
+  }
+  @media print {
+    .proposal-card { box-shadow: none; border: 1px solid #000; }
   }
 </style>
 """,
@@ -128,17 +205,16 @@ def schedule_to_dataframe(schedule: dict, scenario: dict) -> pd.DataFrame:
     prefs = scenario.get("preferred_offs", {})
     rows = []
     for w in workers:
-        row = {"スタッフ": w}
+        row: dict = {"スタッフ": w}
         for d_idx, day in enumerate(days):
             on = schedule[w][d_idx]
             cell = "出勤" if on else "休み"
             if day in prefs.get(w, []):
-                cell = ("出勤⚠希望" if on else "休み✓希望")
+                cell = "出勤⚠希望" if on else "休み✓希望"
             row[day] = cell
-        row["出勤日数"] = int(sum(schedule[w]))
+        row["出勤日数"] = str(int(sum(schedule[w])))
         rows.append(row)
-    # 人数行 — Arrow 互換のため出勤日数は "-"（空文字にしない）
-    daily = {"スタッフ": "（人数）"}
+    daily: dict = {"スタッフ": "（人数）"}
     for d_idx, day in enumerate(days):
         daily[day] = str(sum(1 for w in workers if schedule[w][d_idx]))
     daily["出勤日数"] = "-"
@@ -201,6 +277,103 @@ def build_scenario_from_ui(
     }
 
 
+def load_sample_scenario() -> dict:
+    if SCENARIO_JSON.exists():
+        return load_scenario_json(SCENARIO_JSON.read_text(encoding="utf-8"))
+    return default_scenario()
+
+
+def render_proposal_card(result: dict) -> None:
+    classical = result["classical"]
+    quantum = result["quantum"]
+    sc = result["scenario"]
+    pref_ok = sum(1 for h in classical["pref_hits"] if h["granted"])
+    pref_all = len(classical["pref_hits"])
+    focus = sc.get("qaoa_focus_day", "日")
+    focus_on = "、".join(classical["focus_on"]) or "—"
+    focus_off = "、".join(classical["focus_off"]) or "—"
+
+    if quantum.get("available"):
+        agree = bool(quantum.get("agree_exact"))
+        agree_txt = "一致" if agree else "不一致"
+        q_line = (
+            f"注目日（{focus}）の縮小比較で、古典厳密解と QAOA は「{agree_txt}」。"
+            "勝ち主張ではなく並び確認です。"
+        )
+    else:
+        q_line = (
+            "今回は量子比較をスキップ（古典のみ）。"
+            "OpenQARP 部品は同画面で後から並べられます。"
+        )
+
+    granted = [
+        f"{h['worker']}・{h['day']}" for h in classical["pref_hits"] if h["granted"]
+    ]
+    denied = [
+        f"{h['worker']}・{h['day']}" for h in classical["pref_hits"] if not h["granted"]
+    ]
+    pref_summary = f"希望休 {pref_ok}/{pref_all} 充足"
+    if granted:
+        pref_summary += f"（通った: {', '.join(granted)}）"
+    if denied:
+        pref_summary += f"／ 未充足: {', '.join(denied)}"
+
+    workers_n = len(sc.get("workers", []))
+    html = f"""
+<div class="proposal-card">
+  <div class="pc-head">
+    <p class="pc-title">シフトたたき台・提案サマリー</p>
+    <span class="pc-sub">印刷・画面共有向け ／ PoC</span>
+  </div>
+  <p class="pc-store">店名（仮）サンプルカフェ ○○店　｜　スタッフ {workers_n} 名・週次</p>
+
+  <div class="pc-section">今週のポイント</div>
+  <p class="pc-body">
+    スコア <b>{classical['score']:.0f}</b>　／　{pref_summary}<br/>
+    最低人数 {sc.get('min_staff_per_day')} 名・連続勤務上限 {sc.get('max_consecutive_days')} 日を満たすたたき台です。
+  </p>
+
+  <div class="pc-section">{focus}曜の決め方</div>
+  <p class="pc-body">
+    出勤 <b>{focus_on}</b>　／　休み <b>{focus_off}</b><br/>
+    希望休のぶつかりを見ながら、必要人数を確保する案です（店長確認前提）。
+  </p>
+
+  <div class="pc-section">古典／量子の並び</div>
+  <p class="pc-body">{q_line}</p>
+
+  <div class="pc-cta">
+    <b>お試し価格 CTA（仮）</b>：画面合わせ 0〜数万円／回 → 感触OKなら店舗カスタム（月額数万円〜・仮）。
+    今日は感触確認でOK。正式見積は別途。
+  </div>
+  <p class="pc-foot">
+    製品の中心は古典ソルバ。OpenQARP の QAOA は比較・将来拡張デモ。
+    量子優位性は主張しません。既存シフト SaaS の置き換えではありません。<br/>
+    Credit: Powered by OpenQARP
+  </p>
+</div>
+"""
+    st.markdown(html, unsafe_allow_html=True)
+
+
+def execute_demo(scenario: dict, shots: int, seed: int, run_quantum: bool) -> None:
+    with st.spinner(
+        "古典ソルバで週次シフトを作成中…"
+        + ("／ OpenQARP QAOA 比較も実行" if run_quantum else "")
+    ):
+        try:
+            result = run_full_demo(
+                scenario,
+                shots=int(shots),
+                seed=int(seed),
+                run_quantum=bool(run_quantum),
+            )
+            st.session_state["last_result"] = result
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"実行エラー: {exc}")
+            st.session_state["last_result"] = None
+
+
 # ---- ヒーロー ----
 st.markdown(
     """
@@ -236,6 +409,31 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+# ---- Before / After ----
+st.markdown(
+    """
+<div class="ba-grid">
+  <div class="ba-card ba-before">
+    <h4>手作業だと迷いやすい点</h4>
+    <ul>
+      <li>希望休がぶつかると、誰を休ませるかで毎回悩む</li>
+      <li>日曜など忙しい日の人数確保を後から気づく</li>
+      <li>「たたき台」が無いので最初の1行から手で埋める</li>
+    </ul>
+  </div>
+  <div class="ba-card ba-after">
+    <h4>この PoC だとこう出る</h4>
+    <ul>
+      <li>ボタン1つで週次表＋希望休の通否バッジ</li>
+      <li>注目日の出勤／休み案をすぐ指差しできる</li>
+      <li>古典本体＋ OpenQARP 比較を同じ画面で見せられる</li>
+    </ul>
+  </div>
+</div>
+""",
+    unsafe_allow_html=True,
+)
+
 st.markdown(
     """
 <div class="disclaimer-box">
@@ -249,18 +447,10 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# ---- サイドバー ----
+# ---- サイドバー（詳細設定のみ） ----
 with st.sidebar:
-    st.header("設定")
-    st.caption("スタッフ名・制約を編集するか、JSON を読み込みます。")
-
-    default = default_scenario()
-    input_mode = st.radio(
-        "入力方法",
-        ["フォーム", "JSON 読込"],
-        horizontal=True,
-    )
-
+    st.header("詳細設定")
+    st.caption("ワンクリックデモでは触らなくてOK。")
     shots = st.slider("QAOA ショット数", 200, 2000, 1000, 100)
     seed = st.number_input("乱数シード", value=1234, step=1)
     run_quantum = st.checkbox(
@@ -268,7 +458,6 @@ with st.sidebar:
         value=True,
         help="オフにすると古典のみ。qarp が無い場合は自動でスキップされます。",
     )
-
     qarp_ok = qarp_available()
     if qarp_ok:
         st.markdown(
@@ -281,114 +470,128 @@ with st.sidebar:
             '<span class="badge-soft">古典のみ</span>',
             unsafe_allow_html=True,
         )
-
     st.divider()
     st.markdown("**ブランド**")
     st.caption("OpenQARP — オープンソースの量子アプリケーション開発キット")
     st.caption("製品呼び方: OpenQARPで試作した店舗シフトPoC")
 
-
-# ---- シナリオ入力 ----
-scenario: dict
-if input_mode == "JSON 読込":
-    uploaded = st.file_uploader("シナリオ JSON", type=["json"])
-    sample_btn = st.button("サンプル JSON を読み込む")
-    raw = None
-    if uploaded is not None:
-        raw = uploaded.read().decode("utf-8")
-    elif sample_btn and SCENARIO_JSON.exists():
-        raw = SCENARIO_JSON.read_text(encoding="utf-8")
-        st.code(raw, language="json")
-    if raw:
-        try:
-            scenario = load_scenario_json(raw)
-            st.success("シナリオを読み込みました。")
-        except Exception as exc:
-            st.error(f"JSON エラー: {exc}")
-            scenario = default_scenario()
-    else:
-        scenario = default_scenario()
-        st.info("JSON をアップロードするか「サンプル」を押してください（未指定時は既定）。")
-else:
-    col_a, col_b = st.columns(2)
-    with col_a:
-        workers_text = st.text_input(
-            "スタッフ名（カンマ区切り）",
-            value=", ".join(default["workers"]),
-        )
-        min_staff = st.number_input(
-            "1日の最低人数",
-            min_value=1,
-            max_value=10,
-            value=int(default["min_staff_per_day"]),
-        )
-        max_consec = st.number_input(
-            "連続勤務上限（日）",
-            min_value=1,
-            max_value=7,
-            value=int(default["max_consecutive_days"]),
-        )
-    with col_b:
-        focus_day = st.selectbox(
-            "量子比較の注目日",
-            default["days"],
-            index=default["days"].index(default["qaoa_focus_day"]),
-        )
-        need_on = st.number_input(
-            "注目日の必要出勤人数",
-            min_value=1,
-            max_value=10,
-            value=int(default["qaoa_needed_on_focus"]),
-        )
-        st.caption("希望休は下の表で編集（スタッフ × 曜日）")
-
-    pref_default = []
-    for w, offs in default.get("preferred_offs", {}).items():
-        for day in offs:
-            pref_default.append({"スタッフ": w, "希望休": day})
-    pref_df = st.data_editor(
-        pd.DataFrame(pref_default or [{"スタッフ": "A", "希望休": "日"}]),
-        num_rows="dynamic",
-        width="stretch",
-        key="pref_editor",
-    )
-    scenario = build_scenario_from_ui(
-        workers_text,
-        int(min_staff),
-        int(max_consec),
-        focus_day,
-        int(need_on),
-        pref_df.to_dict("records"),
-    )
-
-# ---- 実行ボタン ----
-run = st.button("シフトを組む", type="primary")
+# ---- ワンクリックデモ ----
+st.markdown(
+    """
+<div class="oneclick-wrap">
+  <b style="font-size:1.02rem;color:#0f172a;">ワンクリック・デモ</b>
+  <p class="hint">
+    サンプル店（4名・希望休入り）を読み込み、フォーム操作なしで週次たたき台まで実行します。
+  </p>
+</div>
+""",
+    unsafe_allow_html=True,
+)
 
 if "last_result" not in st.session_state:
     st.session_state["last_result"] = None
 
-if run:
-    with st.spinner(
-        "古典ソルバで週次シフトを作成中…"
-        + ("／ OpenQARP QAOA 比較も実行" if run_quantum else "")
-    ):
-        try:
-            result = run_full_demo(
-                scenario,
-                shots=int(shots),
-                seed=int(seed),
-                run_quantum=bool(run_quantum),
+demo_clicked = st.button(
+    "サンプル店で今すぐ組む",
+    type="primary",
+    use_container_width=True,
+    key="oneclick_demo",
+)
+
+if demo_clicked:
+    execute_demo(load_sample_scenario(), shots, seed, run_quantum)
+
+# ---- 詳細入力（折りたたみ） ----
+default = default_scenario()
+with st.expander("詳細設定・シナリオ編集（任意）", expanded=False):
+    input_mode = st.radio(
+        "入力方法",
+        ["フォーム", "JSON 読込"],
+        horizontal=True,
+        key="adv_input_mode",
+    )
+    advanced_scenario: dict
+    if input_mode == "JSON 読込":
+        uploaded = st.file_uploader("シナリオ JSON", type=["json"])
+        sample_btn = st.button("サンプル JSON を読み込む", key="adv_sample_json")
+        raw = None
+        if uploaded is not None:
+            raw = uploaded.read().decode("utf-8")
+        elif sample_btn and SCENARIO_JSON.exists():
+            raw = SCENARIO_JSON.read_text(encoding="utf-8")
+            st.code(raw, language="json")
+        if raw:
+            try:
+                advanced_scenario = load_scenario_json(raw)
+                st.success("シナリオを読み込みました。")
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"JSON エラー: {exc}")
+                advanced_scenario = default_scenario()
+        else:
+            advanced_scenario = default_scenario()
+            st.info("JSON をアップロードするか「サンプル」を押してください（未指定時は既定）。")
+    else:
+        col_a, col_b = st.columns(2)
+        with col_a:
+            workers_text = st.text_input(
+                "スタッフ名（カンマ区切り）",
+                value=", ".join(default["workers"]),
             )
-            st.session_state["last_result"] = result
-        except Exception as exc:
-            st.error(f"実行エラー: {exc}")
-            st.session_state["last_result"] = None
+            min_staff = st.number_input(
+                "1日の最低人数",
+                min_value=1,
+                max_value=10,
+                value=int(default["min_staff_per_day"]),
+            )
+            max_consec = st.number_input(
+                "連続勤務上限（日）",
+                min_value=1,
+                max_value=7,
+                value=int(default["max_consecutive_days"]),
+            )
+        with col_b:
+            focus_day = st.selectbox(
+                "量子比較の注目日",
+                default["days"],
+                index=default["days"].index(default["qaoa_focus_day"]),
+            )
+            need_on = st.number_input(
+                "注目日の必要出勤人数",
+                min_value=1,
+                max_value=10,
+                value=int(default["qaoa_needed_on_focus"]),
+            )
+            st.caption("希望休は下の表で編集（スタッフ × 曜日）")
+
+        pref_default = []
+        for w, offs in default.get("preferred_offs", {}).items():
+            for day in offs:
+                pref_default.append({"スタッフ": w, "希望休": day})
+        pref_df = st.data_editor(
+            pd.DataFrame(pref_default or [{"スタッフ": "A", "希望休": "日"}]),
+            num_rows="dynamic",
+            width="stretch",
+            key="pref_editor",
+        )
+        advanced_scenario = build_scenario_from_ui(
+            workers_text,
+            int(min_staff),
+            int(max_consec),
+            focus_day,
+            int(need_on),
+            pref_df.to_dict("records"),
+        )
+
+    custom_run = st.button("この条件でシフトを組む", key="custom_run")
+    if custom_run:
+        execute_demo(advanced_scenario, shots, seed, run_quantum)
 
 result = st.session_state["last_result"]
 
 if result is None:
-    st.markdown("---")
-    st.info("左で条件を確認し、「シフトを組む」を押すと週次表と比較パネルが表示されます。")
+    st.info(
+        "上の「サンプル店で今すぐ組む」を押すと、週次表・提案サマリー・比較パネルが表示されます。"
+    )
     st.markdown(
         """
 <div class="cta-box">
@@ -412,23 +615,22 @@ else:
     pref_ok = sum(1 for h in classical["pref_hits"] if h["granted"])
     pref_all = len(classical["pref_hits"])
     agree_exact = bool(quantum.get("agree_exact")) if quantum.get("available") else None
-    agree_week = bool(result.get("agree_week")) if quantum.get("available") else None
 
-    # ---- メトリクス（HTML カード） ----
+    st.subheader("提案サマリー")
+    render_proposal_card(result)
+
     q_runtime = (
         f"{quantum['qaoa_seconds']:.3f} s"
         if quantum.get("available")
         else "—"
     )
-    agree_html = (
-        _badge(True, "一致", "不一致")
-        if agree_exact is True
-        else (
-            _badge(False, "一致", "不一致")
-            if agree_exact is False
-            else '<span class="badge-soft">量子スキップ</span>'
-        )
-    )
+    if agree_exact is True:
+        agree_html = _badge(True, "一致", "不一致")
+    elif agree_exact is False:
+        agree_html = _badge(False, "一致", "不一致")
+    else:
+        agree_html = '<span class="badge-soft">量子スキップ</span>'
+
     st.markdown(
         f"""
 <div class="metric-strip">
@@ -486,7 +688,6 @@ else:
 
     st.divider()
 
-    # ---- 比較パネル ----
     st.subheader(f"古典 vs 量子（注目日: {sc['qaoa_focus_day']}）— 比較デモ")
     st.caption(
         "量子側は OpenQARP の QAOA で、注目日の希望休コンフリクトを "
