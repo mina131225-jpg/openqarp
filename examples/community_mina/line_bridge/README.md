@@ -15,6 +15,8 @@ OpenQARP コミュニティの **店舗シフト PoC** 向けに、LINE Messagin
 
 Credit: Powered by OpenQARP
 
+**実務で導入するとき**は [ONBOARDING_CHECKLIST.md](./ONBOARDING_CHECKLIST.md) をそのまま使ってください（Streamlit にも同内容のチェック UI あり）。
+
 ---
 
 ## 店舗オンボーディングの流れ
@@ -179,8 +181,10 @@ python examples/community_mina/line_bridge/notify.py --demo --flex
 | `shift_messages.py` | 意図パース・組表・テキスト／Flex・接続ステータス |
 | `config.example.env` | 環境変数テンプレ |
 | `requirements.txt` | flask, requests |
+| `ONBOARDING_CHECKLIST.md` | **店舗オーナー向け導入チェックリスト**（実務ステップ・失敗例） |
 
-Streamlit の「店舗向け」「LINE連携」は `../pitch/app.py` を参照。
+Streamlit の「導入チェックリスト」「店舗向け」「LINE連携」は `../pitch/app.py` を参照。  
+今週お試し課金の最短手順は `../pitch/go_live.md`。
 
 ---
 

@@ -25,8 +25,10 @@ from solver_bridge import (
 
 HERE = Path(__file__).resolve().parent
 PITCH_MD = HERE / "PITCH.md"
+GO_LIVE_MD = HERE / "go_live.md"
 SCENARIO_JSON = HERE.parent / "shift_scenario_tiny.json"
 LINE_BRIDGE = HERE.parent / "line_bridge"
+ONBOARDING_MD = LINE_BRIDGE / "ONBOARDING_CHECKLIST.md"
 
 # LINE 連携（同梱 line_bridge）。未設置でも UI は落ちない。
 _LINE_IMPORT_ERROR: Exception | None = None
@@ -416,6 +418,120 @@ def _line_creds_from_ui(
         "channel_access_token": channel_token,
         "user_id": uid,
     }
+
+
+def render_onboarding_checklist() -> None:
+    """店舗オーナー向け導入チェックリスト（インタラクティブ）。"""
+    st.subheader("導入チェックリスト")
+    st.caption(
+        "御店の LINE 公式で希望休→組表まで繋ぐための実務チェック。"
+        " 開発者個人 LINE は不要です。所要の目安は合計 約5〜30分"
+        "（公式が既にある店は短め、新規作成からだと長め）。"
+    )
+
+    steps = [
+        {
+            "key": "ob_line_oa",
+            "label": "① LINE 公式アカウントを用意する",
+            "mins": "5–10分",
+            "hint": "Official Account Manager で店舗公式を作成／既存を使用",
+        },
+        {
+            "key": "ob_messaging",
+            "label": "② Messaging API チャネル（secret / 長期トークン）",
+            "mins": "5分",
+            "hint": "LINE Developers。応答・あいさつメッセージはオフ推奨",
+        },
+        {
+            "key": "ob_webhook",
+            "label": "③ Webhook URL を設定・検証する",
+            "mins": "5–10分",
+            "hint": "HTTPS の …/webhook（PoC は ngrok 可）。Webhook 利用オン",
+        },
+        {
+            "key": "ob_env",
+            "label": "④ 環境変数（.env）を入れる",
+            "mins": "3–5分",
+            "hint": "LINE_CHANNEL_SECRET / ACCESS_TOKEN。デモのみなら省略可",
+        },
+        {
+            "key": "ob_store",
+            "label": "⑤ Streamlit「店舗向け」で店舗を作成",
+            "mins": "2–3分",
+            "hint": "招待コードを控える（例: MINA01）",
+        },
+        {
+            "key": "ob_invite",
+            "label": "⑥ スタッフを友だち追加＋「登録 店舗コード」で招待",
+            "mins": "3–5分",
+            "hint": "メンバー（マスク）が増えたら OK",
+        },
+        {
+            "key": "ob_test",
+            "label": "⑦ 試験: 登録 / 希望休 / シフト見せて",
+            "mins": "5分",
+            "hint": "必須3発話が返れば接続成功",
+        },
+        {
+            "key": "ob_golive",
+            "label": "⑧ 本番前チェック・お試し範囲の合意",
+            "mins": "3–5分",
+            "hint": "go_live.md の課金前チェックを確認",
+        },
+    ]
+
+    done = 0
+    for step in steps:
+        if step["key"] not in st.session_state:
+            st.session_state[step["key"]] = False
+        checked = st.checkbox(
+            f"{step['label']}  （目安 {step['mins']}）",
+            key=step["key"],
+            help=step["hint"],
+        )
+        st.caption(step["hint"])
+        if checked:
+            done += 1
+
+    total = len(steps)
+    pct = int(round(100.0 * done / total)) if total else 0
+    st.progress(pct / 100.0)
+    st.markdown(
+        f"**進捗: {done}/{total}（{pct}%）**　"
+        f"合計目安 約5〜30分（公式の有無で幅あり）"
+    )
+
+    if st.button("すべて外す", key="ob_reset_btn"):
+        for step in steps:
+            st.session_state[step["key"]] = False
+        st.rerun()
+
+    st.markdown(
+        """**ドキュメント（リポジトリ内）**
+- 詳細手順: `examples/community_mina/line_bridge/ONBOARDING_CHECKLIST.md`
+- 今週お試し課金: `examples/community_mina/pitch/go_live.md`
+- 技術メモ: `examples/community_mina/line_bridge/README.md`"""
+    )
+
+    with st.expander("チェックリスト本文をこの画面で開く", expanded=False):
+        if ONBOARDING_MD.exists():
+            st.markdown(ONBOARDING_MD.read_text(encoding="utf-8"))
+        else:
+            st.warning("ONBOARDING_CHECKLIST.md が見つかりません。")
+    with st.expander("go_live（今週お試し課金）を開く", expanded=False):
+        if GO_LIVE_MD.exists():
+            st.markdown(GO_LIVE_MD.read_text(encoding="utf-8"))
+        else:
+            st.warning("go_live.md が見つかりません。")
+    st.markdown(
+        """
+<div class="product-note">
+  <b>販売時の前提</b>：お客様の LINE 公式が必要。開発者個人 LINE は不要。
+  資格情報未設定時はデモ／プレビューのみ（ライブ送信を主張しない）。
+</div>
+""",
+        unsafe_allow_html=True,
+    )
 
 
 def render_store_section(result: dict | None) -> None:
@@ -1227,7 +1343,9 @@ else:
         unsafe_allow_html=True,
     )
 
-# ---- 店舗向け（マルチテナント）＋ LINE 連携 ----
+# ---- 導入チェックリスト ＋ 店舗向け ＋ LINE 連携 ----
+st.divider()
+render_onboarding_checklist()
 st.divider()
 render_store_section(result)
 st.divider()
