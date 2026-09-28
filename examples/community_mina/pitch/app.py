@@ -26,6 +26,21 @@ from solver_bridge import (
 HERE = Path(__file__).resolve().parent
 PITCH_MD = HERE / "PITCH.md"
 SCENARIO_JSON = HERE.parent / "shift_scenario_tiny.json"
+LINE_BRIDGE = HERE.parent / "line_bridge"
+
+# LINE 連携（同梱 line_bridge）。未設置でも UI は落ちない。
+_LINE_IMPORT_ERROR: Exception | None = None
+try:
+    import sys as _sys
+
+    if str(LINE_BRIDGE) not in _sys.path:
+        _sys.path.insert(0, str(LINE_BRIDGE))
+    import notify as line_notify  # type: ignore
+    import shift_messages as line_msgs  # type: ignore
+except Exception as _exc:  # noqa: BLE001
+    _LINE_IMPORT_ERROR = _exc
+    line_notify = None  # type: ignore
+    line_msgs = None  # type: ignore
 
 st.set_page_config(
     page_title="OpenQARPで試作した店舗シフトPoC",
@@ -354,6 +369,237 @@ def render_proposal_card(result: dict) -> None:
 </div>
 """
     st.markdown(html, unsafe_allow_html=True)
+
+
+
+def _line_creds_from_ui(
+    secret: str,
+    token: str,
+    user_id: str,
+) -> dict[str, str]:
+    """UI 入力 → st.secrets → 環境変数の順で埋める。"""
+    def _secret_get(*keys: str) -> str:
+        try:
+            sec = st.secrets  # type: ignore[attr-defined]
+        except Exception:
+            return ""
+        for k in keys:
+            try:
+                v = sec.get(k, "") if hasattr(sec, "get") else sec[k]
+            except Exception:
+                continue
+            if v:
+                return str(v).strip()
+        return ""
+
+    import os as _os
+
+    channel_secret = (
+        secret.strip()
+        or _secret_get("LINE_CHANNEL_SECRET", "line_channel_secret")
+        or _os.environ.get("LINE_CHANNEL_SECRET", "").strip()
+    )
+    channel_token = (
+        token.strip()
+        or _secret_get("LINE_CHANNEL_ACCESS_TOKEN", "line_channel_access_token")
+        or _os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
+    )
+    uid = (
+        user_id.strip()
+        or _secret_get("LINE_USER_ID", "line_user_id")
+        or _os.environ.get("LINE_USER_ID", "").strip()
+    )
+    return {
+        "channel_secret": channel_secret,
+        "channel_access_token": channel_token,
+        "user_id": uid,
+    }
+
+
+def render_line_section(result: dict | None) -> None:
+    """営業デモ用 LINE 連携セクション。実送信は資格情報があるときのみ。"""
+    st.subheader("LINE連携")
+    st.caption(
+        "希望休の受付 → 自動組表 → 通知、の流れを見せる PoC 層です。"
+        " 資格情報未設定時はデモモード（プレビューのみ・実 LINE 非送信）。"
+    )
+
+    if line_msgs is None or line_notify is None:
+        st.warning(
+            "line_bridge を読み込めませんでした: "
+            + str(_LINE_IMPORT_ERROR)
+        )
+        st.caption(f"想定パス: `{LINE_BRIDGE}`")
+        return
+
+    with st.expander("LINE 資格情報（任意・st.secrets / 環境変数でも可）", expanded=False):
+        st.markdown(
+            "Channel secret / アクセストークン / userId は "
+            "[LINE Developers](https://developers.line.biz/console/) で取得。"
+            " 手順は `examples/community_mina/line_bridge/README.md`。"
+        )
+        col_s, col_t = st.columns(2)
+        with col_s:
+            ui_secret = st.text_input(
+                "Channel secret",
+                value="",
+                type="password",
+                key="line_ui_secret",
+                help="空なら st.secrets または環境変数 LINE_CHANNEL_SECRET",
+            )
+            ui_user = st.text_input(
+                "プッシュ先 userId",
+                value="",
+                key="line_ui_user",
+                help="空なら st.secrets / LINE_USER_ID",
+            )
+        with col_t:
+            ui_token = st.text_input(
+                "Channel access token",
+                value="",
+                type="password",
+                key="line_ui_token",
+                help="空なら st.secrets または環境変数 LINE_CHANNEL_ACCESS_TOKEN",
+            )
+            force_demo = st.checkbox(
+                "強制デモモード（実送信しない）",
+                value=True,
+                key="line_force_demo",
+                help="営業デモではオン推奨。資格情報があっても API を呼びません。",
+            )
+
+    creds = _line_creds_from_ui(
+        st.session_state.get("line_ui_secret", ""),
+        st.session_state.get("line_ui_token", ""),
+        st.session_state.get("line_ui_user", ""),
+    )
+    force_demo = bool(st.session_state.get("line_force_demo", True))
+    status = line_msgs.connection_status(creds, force_demo=force_demo)
+
+    if status == "接続済" and not force_demo:
+        badge = '<span class="badge-ok">接続済</span>'
+        hint = "token + secret あり。テスト送信で実 API を呼べます（自己責任）。"
+    elif status == "デモモード":
+        badge = '<span class="badge-soft">デモモード</span>'
+        hint = "プレビューとログのみ。実 LINE には送りません。"
+    else:
+        badge = '<span class="badge-ng">未設定</span>'
+        hint = "資格情報なし。メッセージ生成プレビューのみ利用できます。"
+
+    st.markdown(
+        f"**ステータス:** {badge}　"
+        f'<span style="color:#64748b;font-size:0.88rem;">{hint}</span>',
+        unsafe_allow_html=True,
+    )
+
+    use_flex = st.radio(
+        "メッセージ形式",
+        ["Flex Message（表）", "テキストのみ"],
+        horizontal=True,
+        key="line_msg_format",
+    )
+    use_flex_flag = use_flex.startswith("Flex")
+
+    gen = st.button(
+        "LINE向けメッセージを生成",
+        use_container_width=True,
+        key="line_generate",
+    )
+
+    if gen:
+        if result is None:
+            # サンプルで組む
+            from solver_bridge import run_classical_week
+
+            sc = load_sample_scenario()
+            classical = run_classical_week(sc)
+            line_result = {"scenario": sc, "classical": classical}
+            st.info("シフト結果が無いため、サンプル店シナリオでメッセージを生成しました。")
+        else:
+            line_result = {
+                "scenario": result["scenario"],
+                "classical": result["classical"],
+            }
+        messages = line_notify.build_messages(
+            line_result,
+            use_flex=use_flex_flag,
+            extra_text="今週のシフトたたき台です（PoC）。",
+        )
+        st.session_state["line_preview"] = {
+            "messages": messages,
+            "text": line_msgs.build_shift_text(line_result),
+            "result": line_result,
+            "use_flex": use_flex_flag,
+        }
+
+    preview = st.session_state.get("line_preview")
+    if preview:
+        st.markdown("**送信プレビュー（実送信前の中身）**")
+        st.code(preview["text"], language=None)
+        with st.expander("LINE Messaging API 用 JSON（messages）"):
+            import json as _json
+
+            st.code(
+                _json.dumps(preview["messages"], ensure_ascii=False, indent=2),
+                language="json",
+            )
+        st.caption(
+            "上記は生成結果です。ステータスが「接続済」かつ強制デモがオフで、"
+            "userId があるときだけ下のテスト送信が実 API を呼びます。"
+        )
+
+        can_live = (
+            status == "接続済"
+            and not force_demo
+            and bool(creds.get("user_id"))
+            and bool(creds.get("channel_access_token"))
+        )
+        send = st.button(
+            "テスト送信",
+            disabled=not can_live,
+            key="line_test_send",
+            help="接続済かつ userId 設定時のみ有効。デモ時は無効。",
+        )
+        if send and can_live:
+            # env に載せて notify に渡す
+            line_msgs.inject_credentials(
+                channel_secret=creds["channel_secret"],
+                channel_access_token=creds["channel_access_token"],
+                user_id=creds["user_id"],
+            )
+            out = line_notify.push_messages(
+                user_id=creds["user_id"],
+                messages=preview["messages"],
+                dry_run=False,
+            )
+            if out.get("sent"):
+                st.success(out.get("detail", "送信しました。"))
+            else:
+                st.warning(
+                    out.get("detail", "送信できませんでした。")
+                    + f" mode={out.get('mode')}"
+                )
+        elif not can_live:
+            st.caption(
+                "テスト送信は無効です（未設定／デモモード、または userId 不足）。"
+                " プレビューだけで営業説明できます。"
+            )
+    else:
+        st.info(
+            "「LINE向けメッセージを生成」を押すと、週次表のテキスト／Flex プレビューが出ます。"
+        )
+
+    st.markdown(
+        """
+<div class="product-note">
+  <b>売り文句の核</b>：LINEで希望休 → 自動組表 → 通知。
+  Webhook 実装は <code>examples/community_mina/line_bridge/</code>。
+  ライブ動作はユーザー自身の LINE 資格情報が必要です。
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
 
 
 def execute_demo(scenario: dict, shots: int, seed: int, run_quantum: bool) -> None:
@@ -803,6 +1049,10 @@ else:
 """,
         unsafe_allow_html=True,
     )
+
+# ---- LINE 連携 ----
+st.divider()
+render_line_section(result)
 
 # ---- ワンページピッチ ----
 st.divider()
