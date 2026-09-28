@@ -26,6 +26,9 @@ _LOCK = threading.RLock()
 # 招待コード: 読みやすい英数字（混同しやすい文字を除外）
 _CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
+# シナリオ workers と対応する枠（登録順に割当）
+WORKER_SLOTS = ["A", "B", "C", "D"]
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
@@ -184,7 +187,89 @@ def get_store_for_user(user_id: str) -> dict[str, Any] | None:
         if not sid:
             return None
         s = db["stores"].get(sid)
-        return deepcopy(s) if s else None
+        if not s:
+            return None
+        if _backfill_worker_ids(s):
+            s["updated_at"] = _now_iso()
+            _save_unlocked(db)
+        return deepcopy(s)
+
+
+def _normalize_display_name(name: str | None) -> str | None:
+    """表示名を正規化。空なら None。"""
+    if name is None:
+        return None
+    n = str(name).strip()
+    if not n:
+        return None
+    # Flex 行ラベル向けに短く（PoC）
+    if len(n) > 12:
+        n = n[:12]
+    return n
+
+
+def _assign_worker_id(store: dict[str, Any]) -> str | None:
+    """未使用の A/B/C/D 枠を登録順で返す。空きがなければ None。"""
+    used = {
+        str(m.get("worker_id") or "").strip()
+        for m in (store.get("members") or [])
+        if m.get("worker_id")
+    }
+    for slot in WORKER_SLOTS:
+        if slot not in used:
+            return slot
+    return None
+
+
+def _backfill_worker_ids(store: dict[str, Any]) -> bool:
+    """既存メンバーに worker_id が無い場合、登録順で A/B/C/D を埋める。"""
+    changed = False
+    members = store.setdefault("members", [])
+    used = {
+        str(m.get("worker_id") or "").strip()
+        for m in members
+        if m.get("worker_id")
+    }
+    for m in members:
+        wid = str(m.get("worker_id") or "").strip()
+        if wid:
+            continue
+        for slot in WORKER_SLOTS:
+            if slot not in used:
+                m["worker_id"] = slot
+                used.add(slot)
+                changed = True
+                break
+        # display_name が無く worker_alias があれば流用
+        if not m.get("display_name") and m.get("worker_alias"):
+            m["display_name"] = m.get("worker_alias")
+            changed = True
+    return changed
+
+
+def get_member(store: dict[str, Any] | None, user_id: str) -> dict[str, Any] | None:
+    """店舗レコードから該当メンバー（コピー）を返す。"""
+    if not store:
+        return None
+    uid = (user_id or "").strip()
+    for m in store.get("members") or []:
+        if m.get("user_id") == uid:
+            return deepcopy(m)
+    return None
+
+
+def display_labels_for_store(store: dict[str, Any] | None) -> dict[str, str]:
+    """worker_id → 表示ラベル（display_name があればそれ、無ければ A/B/C）。"""
+    if not store:
+        return {}
+    labels: dict[str, str] = {}
+    for m in store.get("members") or []:
+        wid = str(m.get("worker_id") or "").strip()
+        if not wid:
+            continue
+        dn = _normalize_display_name(m.get("display_name") or m.get("worker_alias"))
+        labels[wid] = dn if dn else wid
+    return labels
 
 
 def register_user(
@@ -192,11 +277,13 @@ def register_user(
     invite_code: str,
     *,
     worker_alias: str | None = None,
+    display_name: str | None = None,
 ) -> tuple[bool, str, dict[str, Any] | None]:
     """スタッフを店舗に紐付け。
 
     戻り値: (ok, message, store_or_none)
     既に別店舗にいる場合は移籍（PoC は 1 user = 1 store）。
+    登録順に worker_id（A/B/C/D）を割当。display_name / worker_alias で表示名を保存。
     """
     uid = (user_id or "").strip()
     code = (invite_code or "").strip().upper()
@@ -205,12 +292,16 @@ def register_user(
     if not code:
         return False, "店舗コードを指定してください。例: 「登録 MINA01」", None
 
+    # display_name 優先、なければ worker_alias
+    dn = _normalize_display_name(display_name if display_name is not None else worker_alias)
+
     with _LOCK:
         db = _load_unlocked()
         sid = db["invite_index"].get(code)
         if not sid or sid not in db["stores"]:
             return False, f"店舗コード「{code}」が見つかりません。店長に確認してください。", None
         store = db["stores"][sid]
+        _backfill_worker_ids(store)
 
         # 旧店舗から外す
         old_sid = db["user_index"].get(uid)
@@ -222,27 +313,87 @@ def register_user(
 
         already = uid in store.get("line_user_ids", [])
         if not already:
+            slot = _assign_worker_id(store)
             store.setdefault("line_user_ids", []).append(uid)
             store.setdefault("members", []).append(
                 {
                     "user_id": uid,
                     "registered_at": _now_iso(),
-                    "worker_alias": worker_alias,
+                    "worker_id": slot,
+                    "display_name": dn,
+                    "worker_alias": dn,  # 互換: alias = 表示名
                 }
             )
         else:
-            # alias 更新のみ
             for m in store.get("members", []):
-                if m.get("user_id") == uid and worker_alias:
-                    m["worker_alias"] = worker_alias
+                if m.get("user_id") == uid:
+                    if not m.get("worker_id"):
+                        m["worker_id"] = _assign_worker_id(store)
+                    if dn:
+                        m["display_name"] = dn
+                        m["worker_alias"] = dn
+                    break
         db["user_index"][uid] = sid
         store["updated_at"] = _now_iso()
         _save_unlocked(db)
         name = store["store_name"]
+        member = next((m for m in store.get("members", []) if m.get("user_id") == uid), {})
+        slot = member.get("worker_id") or "—"
+        shown = member.get("display_name") or ""
         if already:
             msg = f"「{name}」に登録済みです。"
         else:
-            msg = f"「{name}」に登録しました。"
+            msg = f"「{name}」に登録しました。（枠 {slot}）"
+        if shown:
+            msg += f"\n表示名: {shown}"
+        elif not already:
+            msg += "\nまだ表示名がありません。「名前 太郎」で設定できます。"
+        return True, msg, deepcopy(store)
+
+
+def set_member_display_name(
+    user_id: str,
+    display_name: str,
+) -> tuple[bool, str, dict[str, Any] | None]:
+    """登録済みスタッフの表示名を更新。"""
+    uid = (user_id or "").strip()
+    dn = _normalize_display_name(display_name)
+    if not uid:
+        return False, "userId がありません。", None
+    if not dn:
+        return False, "表示名を指定してください。例: 「名前 太郎」", None
+
+    with _LOCK:
+        db = _load_unlocked()
+        sid = db["user_index"].get(uid)
+        if not sid or sid not in db["stores"]:
+            return False, "まだ店舗に登録されていません。先に「登録 店舗コード」してください。", None
+        store = db["stores"][sid]
+        _backfill_worker_ids(store)
+        found = None
+        for m in store.get("members") or []:
+            if m.get("user_id") == uid:
+                m["display_name"] = dn
+                m["worker_alias"] = dn
+                if not m.get("worker_id"):
+                    m["worker_id"] = _assign_worker_id(store)
+                found = m
+                break
+        if found is None:
+            # line_user_ids だけある場合の救済
+            slot = _assign_worker_id(store)
+            found = {
+                "user_id": uid,
+                "registered_at": _now_iso(),
+                "worker_id": slot,
+                "display_name": dn,
+                "worker_alias": dn,
+            }
+            store.setdefault("members", []).append(found)
+        store["updated_at"] = _now_iso()
+        _save_unlocked(db)
+        slot = found.get("worker_id") or "—"
+        msg = f"表示名を「{dn}」にしました。（枠 {slot}）"
         return True, msg, deepcopy(store)
 
 
@@ -282,11 +433,14 @@ def set_store_preferred_offs(
 def member_rows_masked(store: dict[str, Any]) -> list[dict[str, str]]:
     rows = []
     for m in store.get("members") or []:
+        dn = m.get("display_name") or m.get("worker_alias") or "—"
         rows.append(
             {
                 "user_id_masked": mask_user_id(m.get("user_id", "")),
                 "registered_at": str(m.get("registered_at") or ""),
-                "worker_alias": str(m.get("worker_alias") or "—"),
+                "worker_id": str(m.get("worker_id") or "—"),
+                "display_name": str(dn),
+                "worker_alias": str(m.get("worker_alias") or dn or "—"),
             }
         )
     # line_user_ids にあって members に無い分も
@@ -297,6 +451,8 @@ def member_rows_masked(store: dict[str, Any]) -> list[dict[str, str]]:
                 {
                     "user_id_masked": mask_user_id(uid),
                     "registered_at": "",
+                    "worker_id": "—",
+                    "display_name": "—",
                     "worker_alias": "—",
                 }
             )

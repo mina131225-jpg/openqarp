@@ -130,7 +130,8 @@ def parse_user_intent(text: str) -> dict[str, Any]:
     """LINE テキストから意図を抽出。
 
     例:
-      「登録 MINA01」「登録 店舗コード DEMO01」→ register
+      「登録 MINA01」「登録 DEMO01 太郎」「登録 DEMO01 名前 太郎」→ register
+      「名前 太郎」「名前変更 花子」→ set_name
       「シフト見せて」「シフト表」→ show_shift
       「希望休 日曜」「希望休 A 土」→ set_pref
       その他 → help
@@ -139,28 +140,64 @@ def parse_user_intent(text: str) -> dict[str, Any]:
     normalized = raw.replace("　", " ")
     lower_hint = normalized
 
-    # 登録 <店舗コード>
+    # 表示名変更（登録済みユーザー向け）
+    m_name = re.search(
+        r"^(?:名前(?:変更)?|表示名(?:変更)?|ニックネーム)"
+        r"\s*(?:[:：]\s*)?"
+        r"(?P<name>.+?)\s*$",
+        normalized,
+    )
+    if m_name and not re.search(r"^登録", normalized):
+        name = (m_name.group("name") or "").strip()
+        # 「名前」だけ／「名前変更」だけ
+        if not name or name in {"変更", "を変更", "を設定"}:
+            return {
+                "intent": "set_name_incomplete",
+                "raw": raw,
+                "hint": "例: 「名前 太郎」または「名前変更 花子」",
+            }
+        return {
+            "intent": "set_name",
+            "raw": raw,
+            "display_name": name,
+        }
+
+    # 登録 <店舗コード> [名前 <表示名> | <表示名>]
     m_reg = re.search(
         r"^(?:登録|バインド|紐付[けけ]?)"
         r"(?:\s*店舗(?:コード|ID)?)?"
         r"\s*(?:[:：]\s*)?"
-        r"(?P<code>[A-Za-z0-9]{3,16})\s*$",
+        r"(?P<code>[A-Za-z0-9]{3,16})"
+        r"(?:"
+        r"\s+(?:名前|表示名)\s+(?P<name_kw>.+?)"
+        r"|"
+        r"\s+(?P<name_plain>.+?)"
+        r")?"
+        r"\s*$",
         normalized,
         re.I,
     )
     if m_reg:
+        dn = (m_reg.group("name_kw") or m_reg.group("name_plain") or "").strip() or None
+        # 誤って「登録 CODE シフト」等を名前にしないよう、予約語は無視
+        if dn and re.search(r"^(シフト|希望休|ヘルプ|使い方|help)$", dn, re.I):
+            dn = None
         return {
             "intent": "register",
             "raw": raw,
             "invite_code": m_reg.group("code").upper(),
+            "display_name": dn,
         }
     if re.search(r"^(?:登録|バインド)\s*$", normalized) or re.search(
-        r"^(?:登録|バインド)\s+店舗", normalized
+        r"^(?:登録|バインド)\s+店舗\s*$", normalized
     ):
         return {
             "intent": "register_incomplete",
             "raw": raw,
-            "hint": "例: 「登録 DEMO01」（店長から受け取った店舗コード）",
+            "hint": (
+                "例: 「登録 DEMO01」または「登録 DEMO01 太郎」"
+                "（店長から受け取った店舗コード）"
+            ),
         }
 
     if re.search(r"シフト|組表|スケジュール", lower_hint) and not re.search(
@@ -232,7 +269,12 @@ def apply_pref_to_scenario(
     if day not in prefs[target]:
         prefs[target].append(day)
     sc["preferred_offs"] = prefs
-    note = f"{target} の希望休に「{day}」を登録しました。"
+    label = None
+    labels = sc.get("_display_labels") or {}
+    if isinstance(labels, dict):
+        label = labels.get(target)
+    shown = label if label else target
+    note = f"{shown} の希望休に「{day}」を登録しました。"
     return sc, note
 
 
@@ -256,13 +298,14 @@ def build_shift_text(result: dict[str, Any], *, header: str | None = None) -> st
     prefs = sc.get("preferred_offs", {})
 
     lines: list[str] = []
-    lines.append(header or "【今週のシフトたたき台】")
+    lines.append(header or "【今週のシフト案】")
     lines.append(f"スコア {classical['score']:.0f} ／ 所要 {classical['seconds']*1000:.1f} ms")
     lines.append("")
 
     # ヘッダ行
     lines.append("スタ |" + "|".join(f"{d}" for d in days))
     lines.append("----+" + "+".join("---" for _ in days))
+    labels = sc.get("_display_labels") or {}
     for w in workers:
         cells = []
         for d_idx, day in enumerate(days):
@@ -271,7 +314,10 @@ def build_shift_text(result: dict[str, Any], *, header: str | None = None) -> st
             if day in prefs.get(w, []):
                 mark = "出⚠" if on else "休✓"
             cells.append(f"{mark}")
-        lines.append(f"{w:4}|" + "|".join(f"{c:^3}" for c in cells))
+        label = labels.get(w, w) if isinstance(labels, dict) else w
+        # 全角想定で幅を揃える（最大4文字）
+        lab = str(label)[:4]
+        lines.append(f"{lab:4}|" + "|".join(f"{c:^3}" for c in cells))
 
     pref_ok = sum(1 for h in classical["pref_hits"] if h["granted"])
     pref_all = len(classical["pref_hits"])
@@ -279,7 +325,9 @@ def build_shift_text(result: dict[str, Any], *, header: str | None = None) -> st
     lines.append(f"希望休充足: {pref_ok}/{pref_all}")
     for h in classical["pref_hits"]:
         tag = "✓" if h["granted"] else "✗"
-        lines.append(f"  {tag} {h['worker']}・{h['day']}")
+        hw = h["worker"]
+        hlab = labels.get(hw, hw) if isinstance(labels, dict) else hw
+        lines.append(f"  {tag} {hlab}・{h['day']}")
 
     focus = sc.get("qaoa_focus_day", "日")
     lines.append("")
@@ -289,7 +337,7 @@ def build_shift_text(result: dict[str, Any], *, header: str | None = None) -> st
     )
     lines.append("")
     lines.append(
-        "※ PoC たたき台です。店長確認前提。本体は古典ソルバ。"
+        "※ PoC・店長確認前提。本体は古典ソルバ。"
         " Powered by OpenQARP"
     )
     return "\n".join(lines)
@@ -331,12 +379,14 @@ def build_shift_flex(result: dict[str, Any], *, alt_text: str | None = None) -> 
         for d in days
     ]
 
+    labels = sc.get("_display_labels") or {}
     body_rows: list[dict[str, Any]] = []
     for w in workers:
+        row_label = labels.get(w, w) if isinstance(labels, dict) else w
         cols = [
             {
                 "type": "text",
-                "text": w,
+                "text": str(row_label)[:8] or w,
                 "size": "xs",
                 "flex": 2,
                 "weight": "bold",
@@ -371,7 +421,7 @@ def build_shift_flex(result: dict[str, Any], *, alt_text: str | None = None) -> 
             "contents": [
                 {
                     "type": "text",
-                    "text": "シフトたたき台",
+                    "text": "今週のシフト案",
                     "weight": "bold",
                     "size": "md",
                     "color": "#0f172a",
@@ -415,7 +465,7 @@ def build_shift_flex(result: dict[str, Any], *, alt_text: str | None = None) -> 
 
     return {
         "type": "flex",
-        "altText": alt_text or "今週のシフトたたき台",
+        "altText": alt_text or "今週のシフト案",
         "contents": bubble,
     }
 
@@ -424,9 +474,11 @@ def help_text() -> str:
     return (
         "【使い方】\n"
         "・「登録 DEMO01」→ 店長の店舗コードでスタッフ登録\n"
-        "・「シフト見せて」→ 所属店舗の今週たたき台を返信\n"
-        "・「希望休 日曜」→ 店舗シナリオに希望休を反映して再組表\n"
-        "・「希望休 A 土」→ スタッフ指定で希望休登録\n"
+        "・「登録 DEMO01 太郎」→ 登録と同時に表示名を設定\n"
+        "・「名前 太郎」／「名前変更 花子」→ 表示名の設定・変更\n"
+        "・「シフト見せて」→ 所属店舗の今週のシフト案を返信\n"
+        "・「希望休 日曜」→ 自分の枠に希望休を反映して再組表\n"
+        "・「希望休 A 土」→ スタッフ枠を指定して希望休登録\n"
         "・「ヘルプ」→ この案内\n"
         "\n"
         "※ 販売時はお客様の LINE 公式アカウントを使います。"
@@ -441,7 +493,8 @@ def canned_follow_reply() -> str:
         "友だち追加ありがとうございます。\n"
         "店舗シフト PoC（OpenQARP 試作）です。\n"
         "まず店長から受け取った店舗コードで\n"
-        "「登録 ○○○○」と送ってください。\n"
+        "「登録 ○○○○」または「登録 ○○○○ 太郎」と送ってください。\n"
+        "表示名は後から「名前 太郎」でも設定できます。\n"
         "その後「シフト見せて」「希望休 日曜」が使えます。\n"
         "（資格情報未設定時はデモ返信のみ／開発者個人 LINE は不要）"
     )
@@ -451,13 +504,16 @@ def need_register_text() -> str:
     return (
         "まだ店舗に登録されていません。\n"
         "店長から受け取った店舗コードで\n"
-        "「登録 ○○○○」と送ってください。\n"
-        "例: 「登録 DEMO01」"
+        "「登録 ○○○○」または「登録 ○○○○ 太郎」と送ってください。\n"
+        "例: 「登録 DEMO01」「登録 DEMO01 太郎」"
     )
 
 
 def scenario_for_store(store: dict[str, Any] | None) -> dict[str, Any]:
-    """店舗の preferences をベースシナリオに重ねた週次シナリオを返す。"""
+    """店舗の preferences をベースシナリオに重ねた週次シナリオを返す。
+
+    メンバーの display_name があれば _display_labels に載せて Flex／テキストで使う。
+    """
     sc = load_base_scenario()
     if not store:
         return sc
@@ -470,4 +526,14 @@ def scenario_for_store(store: dict[str, Any] | None) -> dict[str, Any]:
         sc["preferred_offs"] = {
             w: list(v) for w, v in preferred.items()
         }
+    # 表示名マップ（ソルバキーは A/B/C/D のまま）
+    labels: dict[str, str] = {}
+    for m in store.get("members") or []:
+        wid = str(m.get("worker_id") or "").strip()
+        if not wid:
+            continue
+        dn = (m.get("display_name") or m.get("worker_alias") or "").strip()
+        labels[wid] = dn if dn else wid
+    if labels:
+        sc["_display_labels"] = labels
     return sc

@@ -56,9 +56,12 @@ from shift_messages import (  # noqa: E402
     scenario_for_store,
 )
 from stores import (  # noqa: E402
+    display_labels_for_store,
     ensure_demo_store,
+    get_member,
     get_store_for_user,
     register_user,
+    set_member_display_name,
     set_store_preferred_offs,
 )
 
@@ -99,7 +102,12 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
         # デモ店舗が無い環境でも「登録 DEMO01」が通るよう用意
         if (intent.get("invite_code") or "").upper() == "DEMO01":
             ensure_demo_store()
-        ok, note, store = register_user(user_id, intent.get("invite_code") or "")
+        ok, note, store = register_user(
+            user_id,
+            intent.get("invite_code") or "",
+            display_name=intent.get("display_name"),
+            worker_alias=intent.get("display_name"),
+        )
         if ok and store:
             body = (
                 f"{note}\n"
@@ -118,13 +126,34 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
             }
         ]
 
+    if kind == "set_name":
+        ok, note, store = set_member_display_name(
+            user_id, intent.get("display_name") or ""
+        )
+        return [{"type": "text", "text": note}]
+
+    if kind == "set_name_incomplete":
+        return [
+            {
+                "type": "text",
+                "text": intent.get("hint", "") + "\n\n" + help_text(),
+            }
+        ]
+
     if kind == "help" or kind == "set_pref_incomplete":
         msg = help_text()
         if kind == "set_pref_incomplete":
             msg = intent.get("hint", "") + "\n\n" + msg
         store = get_store_for_user(user_id)
         if store:
-            msg = f"所属: {store['store_name']}（{store['invite_code']}）\n\n" + msg
+            member = get_member(store, user_id) or {}
+            slot = member.get("worker_id") or "—"
+            dn = member.get("display_name") or "（未設定）"
+            msg = (
+                f"所属: {store['store_name']}（{store['invite_code']}）\n"
+                f"あなたの枠: {slot} ／ 表示名: {dn}\n\n"
+                + msg
+            )
         else:
             msg = need_register_text() + "\n\n" + msg
         return [{"type": "text", "text": msg}]
@@ -141,12 +170,27 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
                 return [{"type": "text", "text": need_register_text()}]
 
         sc, store = _scenario_for_user(user_id)
+        # 自分の枠を既定にする（「希望休 日曜」→ 登録順の A/B/C/D）
+        default_worker = None
+        if store:
+            member = get_member(store, user_id) or {}
+            default_worker = member.get("worker_id")
+            # 表示名で希望休指定された場合も worker_id に解決
+            w_raw = intent.get("worker")
+            if w_raw:
+                labels = display_labels_for_store(store)
+                inv = {v: k for k, v in labels.items() if v and v != k}
+                if w_raw in inv:
+                    intent = dict(intent)
+                    intent["worker"] = inv[w_raw]
         sc2, note = apply_pref_to_scenario(
             sc,
             worker=intent.get("worker"),
             day=intent.get("day"),
+            default_worker=default_worker,
         )
         if store:
+            # ラベルを維持（apply は deepcopy するが _display_labels もコピーされる）
             set_store_preferred_offs(store["store_id"], sc2.get("preferred_offs") or {})
             note = f"[{store['store_name']}] {note}"
         else:
@@ -169,9 +213,9 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
 
     sc, store = _scenario_for_user(user_id)
     result = run_shift_for_line(sc)
-    header = "今週のシフトたたき台です。"
+    header = "今週のシフト案です。"
     if store:
-        header = f"「{store['store_name']}」の今週のシフトたたき台です。"
+        header = f"「{store['store_name']}」の今週のシフト案です。"
     return [
         {"type": "text", "text": header},
         build_shift_flex(result),
@@ -196,8 +240,8 @@ def process_event(event: dict[str, Any]) -> dict[str, Any] | None:
                 {
                     "type": "text",
                     "text": (
-                        "テキストで「登録 店舗コード」「シフト見せて」"
-                        "または「希望休 日曜」と送ってください。"
+                        "テキストで「登録 店舗コード」「名前 太郎」"
+                        "「シフト見せて」または「希望休 日曜」と送ってください。"
                     ),
                 }
             ]
