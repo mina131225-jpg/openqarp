@@ -54,6 +54,15 @@ print('score', r['classical']['score'], 'qarp', r['qarp_ok'], 'q_ok', r['quantum
 5. 必ず言う: **本体は古典。量子は比較・将来拡張。勝ち主張しない。SaaS 置き換えではない。**  
 6. 詳細トークは `SELLER_SCRIPT.md` をそのまま読む。
 
+## 価格感・次の一歩（仮）
+
+- お試し PoC: 画面合わせ **0〜数万円／回（仮）**
+- 店舗カスタム: **月額数万円〜（仮）**
+- CTA: 「まず30分の画面合わせから」→ 感触OKならカスタム仮見積
+- Credit: **Powered by OpenQARP**
+
+正式見積ではありません。詳細は `PITCH.md` / `SELLER_SCRIPT.md`。
+
 ## 注意
 
 - `QARP_SKIP_ABI_CHECK=1` は、公式以外のビルド／別ツリーの venv 共有時の回避策です。通常の `pip install -e .` では不要なことが多いです。  
