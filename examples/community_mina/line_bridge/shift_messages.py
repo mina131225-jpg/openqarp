@@ -140,8 +140,10 @@ def parse_user_intent(text: str) -> dict[str, Any]:
       登録 / 名前 / 希望休 / シフト見せて / 自分のシフト
     店長:
       店長登録 CODE / シフト3案作って / 今週の人件費見せて
-      人件費を下げて再計算 / 人件費 N円以内で組み直して
+      人件費を下げて再計算 / 人件費 N円以内で組み直して / 人件費予算 N
       確定 [案] / Aさんは週20時間以内 / 時給 1200 / 割増 ...
+      給与 今月 / 給与 太郎 / 給与確定 9月 / 給与明細 太郎 9月 / 給与CSV 9月
+      交通費 / 手当 / 深夜時給 / 残業時給 / 実績 ...
     """
     raw = (text or "").strip()
     normalized = raw.replace("　", " ")
@@ -170,7 +172,179 @@ def parse_user_intent(text: str) -> dict[str, Any]:
             "hint": "例: 「店長登録 DEMO01」",
         }
 
-    # --- シフト3案 ---
+    # --- 給与 / 人件費予算 / CSV / 実績 / 交通費・手当・深夜時給・残業時給 ---
+    # 給与CSV 9月
+    m_csv = re.search(
+        r"^(?:給与\s*CSV|給与CSV|給与csv)\s*(?P<month>.+?)?\s*$",
+        normalized,
+        re.I,
+    )
+    if m_csv:
+        return {
+            "intent": "payroll_csv",
+            "raw": raw,
+            "month": (m_csv.group("month") or "今月").strip() or "今月",
+        }
+
+    # 給与確定 9月
+    m_lock = re.search(
+        r"^(?:給与確定|給与を確定|給与ロック)\s*(?P<month>.+?)?\s*$",
+        normalized,
+    )
+    if m_lock:
+        return {
+            "intent": "payroll_lock",
+            "raw": raw,
+            "month": (m_lock.group("month") or "今月").strip() or "今月",
+        }
+
+    # 給与明細 太郎 9月
+    m_slip = re.search(
+        r"^(?:給与明細|明細)\s+"
+        r"(?P<who>[A-Za-zぁ-んァ-ン一-龥][A-Za-z0-9ぁ-んァ-ン一-龥]*)\s*"
+        r"(?:さん|くん|ちゃん)?\s*"
+        r"(?P<month>.+?)?\s*$",
+        normalized,
+    )
+    if m_slip:
+        return {
+            "intent": "payroll_payslip",
+            "raw": raw,
+            "who": m_slip.group("who"),
+            "month": (m_slip.group("month") or "今月").strip() or "今月",
+        }
+
+    # 給与 今月 / 給与 太郎
+    m_pay = re.search(
+        r"^(?:給与|給与見[込み]|給料)\s*(?P<arg>.+?)?\s*$",
+        normalized,
+    )
+    if m_pay:
+        arg = (m_pay.group("arg") or "").strip() or "今月"
+        if arg in {"今月", "当月", "この月"} or re.match(
+            r"^(?:20\d{2}[-/年])?(?:1[0-2]|0?[1-9])\s*月?$", arg
+        ):
+            return {"intent": "payroll_month", "raw": raw, "month": arg}
+        # 人名
+        who = re.sub(r"(さん|くん|ちゃん)$", "", arg).strip()
+        return {"intent": "payroll_staff", "raw": raw, "who": who, "month": "今月"}
+
+    # 人件費予算 200000
+    m_budg = re.search(
+        r"^(?:人件費予算|予算人件費|人件費の予算)\s*(?:を|は|:|：)?\s*"
+        r"(?P<yen>[0-9][0-9,]*)\s*円?\s*$",
+        normalized,
+    )
+    if m_budg:
+        return {
+            "intent": "set_labor_budget",
+            "raw": raw,
+            "budget_yen": int(m_budg.group("yen").replace(",", "")),
+        }
+
+    # 交通費 太郎 500 / 交通費 500
+    m_com = re.search(
+        r"^(?:交通費)\s+"
+        r"(?:(?P<who>[A-Za-zぁ-んァ-ン一-龥][A-Za-z0-9ぁ-んァ-ン一-龥]*)\s*"
+        r"(?:さん|くん|ちゃん)?\s+)?"
+        r"(?P<yen>[0-9][0-9,]*)\s*円?\s*$",
+        normalized,
+    )
+    if m_com:
+        return {
+            "intent": "set_commute",
+            "raw": raw,
+            "who": m_com.group("who"),
+            "commute_allowance": int(m_com.group("yen").replace(",", "")),
+        }
+
+    # 手当 太郎 役職手当 5000 / 手当 太郎 役職手当 5000 月
+    m_all = re.search(
+        r"^(?:手当|各種手当)\s+"
+        r"(?P<who>[A-Za-zぁ-んァ-ン一-龥][A-Za-z0-9ぁ-んァ-ン一-龥]*)\s*"
+        r"(?:さん|くん|ちゃん)?\s+"
+        r"(?P<name>[ぁ-んァ-ン一-龥ーA-Za-z0-9]+)\s+"
+        r"(?P<yen>[0-9][0-9,]*)\s*円?\s*"
+        r"(?P<typ>月|毎月|出勤|日|シフト)?\s*$",
+        normalized,
+    )
+    if m_all:
+        typ_raw = (m_all.group("typ") or "月").strip()
+        typ = "per_shift" if typ_raw in {"出勤", "日", "シフト"} else "monthly"
+        return {
+            "intent": "set_allowance",
+            "raw": raw,
+            "who": m_all.group("who"),
+            "allowance_name": m_all.group("name"),
+            "amount": int(m_all.group("yen").replace(",", "")),
+            "allowance_type": typ,
+        }
+
+    # 深夜時給 太郎 1500 / 残業時給 太郎 1500
+    m_nw = re.search(
+        r"^(?P<kind>深夜時給|残業時給)\s+"
+        r"(?:(?P<who>[A-Za-zぁ-んァ-ン一-龥][A-Za-z0-9ぁ-んァ-ン一-龥]*)\s*"
+        r"(?:さん|くん|ちゃん)?\s+)?"
+        r"(?P<wage>[0-9][0-9,]*)\s*円?\s*$",
+        normalized,
+    )
+    if m_nw:
+        return {
+            "intent": "set_night_wage" if m_nw.group("kind") == "深夜時給" else "set_ot_wage",
+            "raw": raw,
+            "who": m_nw.group("who"),
+            "hourly_wage": int(m_nw.group("wage").replace(",", "")),
+        }
+
+    # 実績 太郎 80 / 実績 太郎 80時間 深夜8 残業4 / 実績時間 太郎 80
+    m_act = re.search(
+        r"^(?:実績(?:時間)?|実働)\s+"
+        r"(?P<who>[A-Za-zぁ-んァ-ン一-龥][A-Za-z0-9ぁ-んァ-ン一-龥]*)\s*"
+        r"(?:さん|くん|ちゃん)?\s*"
+        r"(?P<body>.+)?\s*$",
+        normalized,
+    )
+    if m_act:
+        body = (m_act.group("body") or "").strip()
+        hours = None
+        night = None
+        ot = None
+        days = None
+        month = "今月"
+        m_h = re.search(r"(?<![深残])(?P<h>[0-9]+(?:\.[0-9]+)?)\s*時間?", body)
+        if m_h and "深夜" not in body[: m_h.start() + 1]:
+            # prefer explicit 時間 or leading number
+            pass
+        m_h2 = re.search(r"(?:^|\s)(?P<h>[0-9]+(?:\.[0-9]+)?)\s*(?:時間)", body)
+        m_h3 = re.search(r"^(?P<h>[0-9]+(?:\.[0-9]+)?)\s*(?:時間)?(?:\s|$)", body)
+        if m_h2:
+            hours = float(m_h2.group("h"))
+        elif m_h3:
+            hours = float(m_h3.group("h"))
+        m_n = re.search(r"深夜\s*(?P<n>[0-9]+(?:\.[0-9]+)?)\s*(?:時間)?", body)
+        if m_n:
+            night = float(m_n.group("n"))
+        m_o = re.search(r"残業\s*(?P<o>[0-9]+(?:\.[0-9]+)?)\s*(?:時間)?", body)
+        if m_o:
+            ot = float(m_o.group("o"))
+        m_d = re.search(r"(?:出勤|勤務)\s*(?P<d>[0-9]+)\s*日", body)
+        if m_d:
+            days = int(m_d.group("d"))
+        m_m = re.search(r"(?P<m>(?:20\d{2}[-/年])?(?:1[0-2]|0?[1-9])\s*月|今月)", body)
+        if m_m:
+            month = m_m.group("m").strip()
+        return {
+            "intent": "set_actual_hours",
+            "raw": raw,
+            "who": m_act.group("who"),
+            "actual_hours": hours,
+            "night_hours": night,
+            "ot_hours": ot,
+            "work_days": days,
+            "month": month,
+        }
+
+        # --- シフト3案 ---
     if re.search(r"シフト\s*3案|3案作|三案作|シフト案.*作", normalized):
         return {"intent": "make_three_plans", "raw": raw}
 
@@ -638,23 +812,32 @@ def help_text() -> str:
         "■ スタッフ\n"
         "・「登録 DEMO01」／「登録 DEMO01 太郎」→ 店舗登録\n"
         "・「名前 太郎」→ 表示名\n"
-        "・「時給 1200」→ 自分の時給（予定人件費用）\n"
+        "・「時給 1200」→ 自分の時給\n"
         "・「希望休 日曜」→ 希望休を反映して再組表\n"
         "・「シフト見せて」→ 店舗の今週案\n"
         "・「自分のシフト」→ 自分の枠だけ表示\n"
         "\n"
-        "■ 店長\n"
-        "・「店長登録 DEMO01」→ 店長フラグ付与（最初の登録者も店長）\n"
+        "■ 店長（シフト）\n"
+        "・「店長登録 DEMO01」→ 店長フラグ付与\n"
         "・「シフト3案作って」→ 希望優先／人件費優先／バランス\n"
-        "・「今週の人件費見せて」→ 予定人件費シミュレーション\n"
+        "・「今週の人件費見せて」→ 予定人件費（通勤・深夜・残業見込込み）\n"
         "・「人件費を下げて再計算」／「人件費 120000円以内で組み直して」\n"
+        "・「人件費予算 200000」→ 月次人件費予算\n"
         "・「太郎さんは週20時間以内」→ 週上限\n"
         "・「割増 土日 1.25」→ 土日割増倍率\n"
         "・「確定」「確定 希望」「確定 2」→ 案を保存しスタッフへ通知\n"
         "\n"
+        "■ 店長（給与見込み・明細 ※振込なし）\n"
+        "・「交通費 太郎 500」「深夜時給 太郎 1500」「残業時給 太郎 1500」\n"
+        "・「手当 太郎 役職手当 5000」\n"
+        "・「給与 今月」「給与 太郎」\n"
+        "・「実績 太郎 80時間 深夜8 残業4」\n"
+        "・「給与確定 9月」「給与明細 太郎 9月」「給与CSV 9月」\n"
+        "\n"
         f"{POC_BRANDING_COPY}\n"
-        "※ 予定人件費はシミュレーションです（給与計算・支払いではありません）。\n"
-        "※ 組表本体は古典ソルバ。QUBO/QAOA は注目日比較フック時のみ明示します。\n"
+        "※ 給与は見込み・明細・CSVまで。銀行振込は行いません。\n"
+        "※ 組表本体は古典ソルバ（classical_greedy_heuristic）。"
+        "QAOA は注目日比較時のみ明示します。\n"
         "※ 販売時はお客様の LINE 公式アカウントを使います。開発者個人 LINE は不要です。\n"
         "Credit: Powered by OpenQARP"
     )

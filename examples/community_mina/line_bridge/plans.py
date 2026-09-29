@@ -2,10 +2,10 @@
 """店長向け 3 案シフト生成と予定人件費シミュレーション（PoC）。
 
 方針（正直ラベル）:
-  - 組表本体は古典ヒューリスティック（貪欲＋局所改善）。
+  - 組表本体は古典ヒューリスティック（貪欲＋局所改善）classical_greedy_heuristic。
   - 希望優先 / 人件費優先 / バランス は重み・割当順の違いで 3 案を作る。
-  - 予定人件費はシフト日数 × 1シフト時間 × 時給（＋土日/祝日割増）のシミュレーション。
-    給与計算・支払いは行わない。
+  - 予定人件費は 時給×時間×(土日/祝日割増) + 交通費 + 深夜見込 + 残業見込 + 手当按分。
+    給与確定・銀行振込は行わない（payroll.py が月次見込み／明細を担当）。
   - QUBO/QAOA は注目日の比較フック（利用可能なときのみ）。週次全体の量子最適化ではない。
 """
 
@@ -34,6 +34,12 @@ from stores import (  # noqa: E402
     staff_profiles_for_store,
 )
 
+try:
+    from payroll import enrich_profiles_for_payroll, estimate_shift_labor_components  # noqa: E402
+except Exception:  # noqa: BLE001
+    enrich_profiles_for_payroll = None  # type: ignore
+    estimate_shift_labor_components = None  # type: ignore
+
 PLAN_LABELS = {
     "prefer": "希望優先",
     "cost": "人件費優先",
@@ -43,7 +49,8 @@ PLAN_ORDER = ["prefer", "cost", "balance"]
 
 POC_FOOTER = (
     "OpenQARP（量子アプリ）で試作した店舗シフトPoC。"
-    "組表本体は古典ソルバ。予定人件費はシミュレーション（給与計算ではない）。"
+    "組表本体は古典ソルバ（classical_greedy_heuristic）。"
+    "予定人件費は通勤・深夜・残業見込込みのシミュレーション（振込なし）。"
     "店長確認前提。"
 )
 
@@ -127,33 +134,68 @@ def compute_metrics(
     cost_breakdown: list[dict[str, Any]] = []
     hour_cap_violations = 0
     availability_violations = 0
+    labor_extra: dict[str, Any] = {}
+    used_full_labor = False
+    # 総人件費: 通勤・深夜見込・残業見込・手当込み（payroll があれば）
+    if estimate_shift_labor_components is not None:
+        try:
+            prof2 = profiles
+            if enrich_profiles_for_payroll is not None:
+                prof2 = enrich_profiles_for_payroll(store, scenario)
+            est = estimate_shift_labor_components(
+                schedule, scenario, store, profiles=prof2
+            )
+            labor_cost = float(est["projected_labor_cost"])
+            cost_breakdown = list(est.get("cost_breakdown") or [])
+            labor_extra = {
+                "commute_total": est.get("commute_total"),
+                "night_premium_total": est.get("night_premium_total"),
+                "ot_premium_total": est.get("ot_premium_total"),
+                "allowance_total": est.get("allowance_total"),
+                "labor_includes": est.get("includes"),
+                "labor_method": est.get("method"),
+            }
+            profiles = prof2
+            used_full_labor = True
+        except Exception:  # noqa: BLE001
+            used_full_labor = False
+
+    if not used_full_labor:
+        labor_cost = 0.0
+        cost_breakdown = []
+        for w in workers:
+            wage = int((profiles.get(w) or {}).get("hourly_wage") or DEFAULT_HOURLY_WAGE)
+            cap = (profiles.get(w) or {}).get("max_hours_week")
+            w_hours = loads[w] * hps
+            w_cost = 0.0
+            for d_idx, day in enumerate(days):
+                if not schedule[w][d_idx]:
+                    continue
+                mult = _day_multiplier(day, premiums, weekend, holidays)
+                w_cost += wage * hps * mult
+            labor_cost += w_cost
+            cost_breakdown.append(
+                {
+                    "worker": w,
+                    "shifts": loads[w],
+                    "hours": w_hours,
+                    "hourly_wage": wage,
+                    "projected_cost": round(w_cost),
+                    "max_hours_week": cap,
+                }
+            )
+
     for w in workers:
-        wage = int((profiles.get(w) or {}).get("hourly_wage") or DEFAULT_HOURLY_WAGE)
         cap = (profiles.get(w) or {}).get("max_hours_week")
         avail = (profiles.get(w) or {}).get("available_days")
         w_hours = loads[w] * hps
         if cap is not None and w_hours > float(cap) + 1e-9:
             hour_cap_violations += 1
-        w_cost = 0.0
         for d_idx, day in enumerate(days):
             if not schedule[w][d_idx]:
                 continue
             if isinstance(avail, list) and avail and day not in avail:
                 availability_violations += 1
-            mult = _day_multiplier(day, premiums, weekend, holidays)
-            day_cost = wage * hps * mult
-            w_cost += day_cost
-        labor_cost += w_cost
-        cost_breakdown.append(
-            {
-                "worker": w,
-                "shifts": loads[w],
-                "hours": w_hours,
-                "hourly_wage": wage,
-                "projected_cost": round(w_cost),
-                "max_hours_week": cap,
-            }
-        )
 
     # 公平性: 勤務日数の分散が小さいほど高い（0〜100）
     load_vals = list(loads.values())
@@ -185,6 +227,12 @@ def compute_metrics(
         "hours_per_shift": hps,
         "projected_labor_cost": int(round(labor_cost)),
         "cost_breakdown": cost_breakdown,
+        "commute_total": labor_extra.get("commute_total"),
+        "night_premium_total": labor_extra.get("night_premium_total"),
+        "ot_premium_total": labor_extra.get("ot_premium_total"),
+        "allowance_sim_total": labor_extra.get("allowance_total"),
+        "labor_includes": labor_extra.get("labor_includes"),
+        "labor_method": labor_extra.get("labor_method") or "classical_day_premium_only",
         "fairness": round(fairness, 1),
         "loads": loads,
         "hour_cap_violations": hour_cap_violations,
@@ -201,8 +249,9 @@ def _greedy_variant(
     mode: str,
     profiles: dict[str, dict],
     hours_per_shift: float,
+    store: dict[str, Any] | None = None,
 ) -> tuple[dict[str, list[bool]], float, float]:
-    """mode=prefer|cost|balance の貪欲＋局所改善。"""
+    """mode=prefer|cost|balance の貪欲＋局所改善。人件費は総コスト（通勤・深夜・残業見込）。"""
     started = time.perf_counter()
     workers = list(scenario["workers"])
     days = list(scenario["days"])
@@ -214,6 +263,13 @@ def _greedy_variant(
 
     def wage_of(w: str) -> int:
         return int((profiles.get(w) or {}).get("hourly_wage") or DEFAULT_HOURLY_WAGE)
+
+    def unit_cost_of(w: str) -> float:
+        """割当順用の単価スコア（時給 + 交通費/hps）。安いほど先。"""
+        p = profiles.get(w) or {}
+        wage = float(p.get("hourly_wage") or DEFAULT_HOURLY_WAGE)
+        commute = float(p.get("commute_allowance") or 0)
+        return wage + (commute / max(hours_per_shift, 1.0))
 
     def cap_remaining(w: str) -> float:
         cap = (profiles.get(w) or {}).get("max_hours_week")
@@ -236,14 +292,15 @@ def _greedy_variant(
             load = sum(schedule[w][:d_idx])
             wage = wage_of(w)
             avail_pen = 0 if can_work(w, day) else 1
+            unit = unit_cost_of(w)
             if mode == "prefer":
                 # 希望休を最優先で避ける → 希望者は後回し
-                return (avail_pen, pref_pen, load, wage, w)
+                return (avail_pen, pref_pen, load, unit, w)
             if mode == "cost":
-                # 安い人を先に、希望は弱めに考慮
-                return (avail_pen, wage, pref_pen, load, w)
+                # 安い人（時給+交通）を先に、希望は弱めに考慮
+                return (avail_pen, unit, pref_pen, load, w)
             # balance: 負荷均等を優先しつつ希望も見る
-            return (avail_pen, load, pref_pen, wage, w)
+            return (avail_pen, load, pref_pen, unit, w)
 
         ranked = sorted(workers, key=rank_key)
         for w in ranked:
@@ -280,14 +337,19 @@ def _greedy_variant(
     # 局所改善: 目的に応じたスコア
     def local_score(sch: dict[str, list[bool]]) -> float:
         base = ssd.score_schedule(sch, scenario)
-        # 人件費項（安いほど加点）— 正規化のため万円単位で減点
-        cost = 0.0
-        for w in workers:
-            wage = wage_of(w)
-            for d_idx, day in enumerate(days):
-                if sch[w][d_idx]:
-                    # 簡易: 割増なしで局所改善（最終 metrics で割増込み）
-                    cost += wage * hours_per_shift
+        # 人件費項: 総コスト（通勤・深夜・残業見込込み）。なければ時給+交通
+        if estimate_shift_labor_components is not None:
+            try:
+                est = estimate_shift_labor_components(sch, scenario, store, profiles=profiles)
+                cost = float(est["projected_labor_cost"])
+            except Exception:  # noqa: BLE001
+                cost = 0.0
+                for w in workers:
+                    cost += unit_cost_of(w) * sum(sch[w]) * hours_per_shift
+        else:
+            cost = 0.0
+            for w in workers:
+                cost += unit_cost_of(w) * sum(sch[w]) * hours_per_shift
         cost_term = cost / 10000.0
         # 公平性
         loads = [sum(sch[w]) for w in workers]
@@ -373,6 +435,11 @@ def generate_three_plans(
     # ソルバ用メタを除去しても良いが、validate は _display_labels を無視するのでそのままでも可
     ssd.validate_scenario({k: v for k, v in sc.items() if not str(k).startswith("_")})
     profiles, hps, _, _, _ = _profiles_and_meta(store, sc)
+    if enrich_profiles_for_payroll is not None:
+        try:
+            profiles = enrich_profiles_for_payroll(store, sc)
+        except Exception:  # noqa: BLE001
+            pass
 
     # ベースライン: デモ既存の classical_greedy（最適化「前」相当）
     t0 = time.perf_counter()
@@ -392,7 +459,9 @@ def generate_three_plans(
 
     plans: list[dict[str, Any]] = []
     for key in PLAN_ORDER:
-        sched, score, sec = _greedy_variant(sc, mode=key, profiles=profiles, hours_per_shift=hps)
+        sched, score, sec = _greedy_variant(
+            sc, mode=key, profiles=profiles, hours_per_shift=hps, store=store
+        )
         plans.append(
             _plan_dict(key, sched, sc, store=store, profiles=profiles, seconds=sec, solver_score=score)
         )
@@ -602,11 +671,18 @@ def labor_cost_summary(
 
 
 def metrics_one_liner(m: dict[str, Any]) -> str:
+    extra = ""
+    if m.get("commute_total") or m.get("night_premium_total") or m.get("ot_premium_total"):
+        extra = (
+            f"（交通{int(m.get('commute_total') or 0):,}"
+            f"+深夜増{int(m.get('night_premium_total') or 0):,}"
+            f"+残業増{int(m.get('ot_premium_total') or 0):,}）"
+        )
     return (
         f"希望休 {m['pref_ok']}/{m['pref_all']} ／ "
         f"人数不足 {m['staffing_violations']}日 ／ "
         f"総時間 {m['total_hours']:g}h ／ "
-        f"予定人件費 {m['projected_labor_cost']:,}円 ／ "
+        f"予定人件費 {m['projected_labor_cost']:,}円{extra} ／ "
         f"公平性 {m['fairness']:g}"
     )
 
@@ -786,15 +862,24 @@ def format_labor_cost_text(summary: dict[str, Any], *, store_name: str | None = 
         f"出典: {summary.get('note') or summary.get('source')}",
         metrics_one_liner(m),
         "",
-        "内訳（予定）:",
+        "内訳（予定・総人件費）:",
     ]
-    labels = {}
     for row in m.get("cost_breakdown") or []:
-        w = row["worker"]
-        lines.append(
-            f"  {w}: {row['shifts']}日出勤 / {row['hours']:g}h / "
-            f"時給{row['hourly_wage']}円 → {row['projected_cost']:,}円"
-        )
+        w = row.get("display_name") or row["worker"]
+        bits = [
+            f"{row.get('shifts', row.get('work_days', '?'))}日出勤",
+            f"{row['hours']:g}h",
+            f"時給{row['hourly_wage']}円",
+        ]
+        if row.get("commute"):
+            bits.append(f"交通{row['commute']:,}")
+        if row.get("night_premium_yen"):
+            bits.append(f"深夜増{row['night_premium_yen']:,}")
+        if row.get("ot_premium_yen"):
+            bits.append(f"残業増{row['ot_premium_yen']:,}")
+        lines.append(f"  {w}: {' / '.join(bits)} → {row['projected_cost']:,}円")
+    if m.get("labor_method"):
+        lines.append(f"算定: {m.get('labor_method')}")
     lines.append("")
     lines.append(f"※ {POC_FOOTER}")
     return "\n".join(lines)
@@ -838,6 +923,8 @@ def bundle_for_storage(bundle: dict[str, Any]) -> dict[str, Any]:
                     "pref_ok", "pref_all", "staffing_violations", "total_hours",
                     "projected_labor_cost", "fairness", "loads", "solver_score",
                     "seconds", "method", "hour_cap_violations", "availability_violations",
+                    "commute_total", "night_premium_total", "ot_premium_total",
+                    "allowance_sim_total", "labor_method",
                 )
                 if k in p["metrics"]
             },

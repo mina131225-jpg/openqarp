@@ -29,15 +29,17 @@ _CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 # シナリオ workers と対応する枠（登録順に割当）
 WORKER_SLOTS = ["A", "B", "C", "D"]
 
-# PoC 既定: 時給・1シフト時間（予定人件費シミュレーション用。給与計算ではない）
+# PoC 既定: 時給・1シフト時間（予定人件費／給与見込み用。振込はしない）
 DEFAULT_HOURLY_WAGE = 1100
 DEFAULT_HOURS_PER_SHIFT = 8.0
 DEFAULT_WAGE_PREMIUMS = {
     "weekend": 1.25,  # 土日割増倍率
     "holiday": 1.35,  # 祝日割増（PoC: holiday_days 指定時）
-    "night": 1.25,    # 深夜割増（日単位ソルバでは未使用・設定のみ保持）
+    "night": 1.25,    # 深夜割増（深夜時給未設定時の倍率）
 }
 DEFAULT_WEEKEND_DAYS = ["土", "日"]
+DEFAULT_COMMUTE_ALLOWANCE = 0
+DEFAULT_OT_MULTIPLIER = 1.25
 MANAGER_OWNER_CODE_ENV = "LINE_STORE_OWNER_CODE"  # optional global owner code
 
 
@@ -159,6 +161,10 @@ def create_store(
             "holiday_days": [],
             "pending_plans": None,
             "confirmed_plan": None,
+            "labor_budget_monthly": None,
+            "payroll_months": {},
+            "actual_hours_by_month": {},
+            "night_hours_per_weekend_shift": 2.0,
             "created_at": _now_iso(),
             "updated_at": _now_iso(),
         }
@@ -305,6 +311,31 @@ def _backfill_worker_ids(store: dict[str, Any]) -> bool:
     if "confirmed_plan" not in store:
         store["confirmed_plan"] = None
         changed = True
+    for m in members:
+        if "commute_allowance" not in m:
+            m["commute_allowance"] = DEFAULT_COMMUTE_ALLOWANCE
+            changed = True
+        if "allowances" not in m:
+            m["allowances"] = []
+            changed = True
+        if "night_hourly_wage" not in m:
+            m["night_hourly_wage"] = None
+            changed = True
+        if "overtime_hourly_wage" not in m:
+            m["overtime_hourly_wage"] = None
+            changed = True
+    if "labor_budget_monthly" not in store:
+        store["labor_budget_monthly"] = None
+        changed = True
+    if "payroll_months" not in store:
+        store["payroll_months"] = {}
+        changed = True
+    if "actual_hours_by_month" not in store:
+        store["actual_hours_by_month"] = {}
+        changed = True
+    if "night_hours_per_weekend_shift" not in store:
+        store["night_hours_per_weekend_shift"] = 2.0
+        changed = True
     return changed
 
 
@@ -386,6 +417,10 @@ def register_user(
                     "display_name": dn,
                     "worker_alias": dn,  # 互換: alias = 表示名
                     "hourly_wage": DEFAULT_HOURLY_WAGE,
+                    "night_hourly_wage": None,
+                    "overtime_hourly_wage": None,
+                    "commute_allowance": DEFAULT_COMMUTE_ALLOWANCE,
+                    "allowances": [],
                     "max_hours_week": None,
                     "available_days": None,  # None = 全日可
                     "role": None,
@@ -513,6 +548,7 @@ def member_rows_masked(store: dict[str, Any]) -> list[dict[str, Any]]:
                 "display_name": str(dn),
                 "worker_alias": str(m.get("worker_alias") or dn or "—"),
                 "hourly_wage": int(m.get("hourly_wage") or DEFAULT_HOURLY_WAGE),
+                "commute_allowance": int(m.get("commute_allowance") or DEFAULT_COMMUTE_ALLOWANCE),
                 "max_hours_week": m.get("max_hours_week"),
                 "is_manager": bool(m.get("is_manager")),
             }
@@ -552,6 +588,10 @@ def staff_profiles_for_store(store: dict[str, Any] | None) -> dict[str, dict[str
             "user_id": m.get("user_id"),
             "display_name": dn or wid,
             "hourly_wage": int(m.get("hourly_wage") or DEFAULT_HOURLY_WAGE),
+            "night_hourly_wage": m.get("night_hourly_wage"),
+            "overtime_hourly_wage": m.get("overtime_hourly_wage"),
+            "commute_allowance": int(m.get("commute_allowance") or DEFAULT_COMMUTE_ALLOWANCE),
+            "allowances": list(m.get("allowances") or []),
             "max_hours_week": m.get("max_hours_week"),
             "available_days": m.get("available_days"),
             "role": m.get("role"),

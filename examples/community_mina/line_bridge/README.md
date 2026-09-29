@@ -45,18 +45,31 @@ Credit: Powered by OpenQARP
 |----------|------|
 | `店長登録 DEMO01` | 店長フラグ付与（最初の登録者も自動で店長） |
 | `シフト3案作って` | 希望優先／人件費優先／バランスの 3 案＋指標＋最適化前比較 |
-| `今週の人件費見せて` | 予定人件費シミュレーション（給与計算ではない） |
+| `今週の人件費見せて` | 週次予定人件費（通勤・深夜・残業見込込み。振込なし） |
 | `人件費を下げて再計算` | 人件費寄せで再生成 |
 | `人件費 120000円以内で組み直して` | 予算付き再生成 |
 | `太郎さんは週20時間以内` | 週の最大勤務時間 |
 | `時給 1200` / `時給 太郎 1500` | 時給（予定人件費用） |
 | `割増 土日 1.25` | 土日・祝日・深夜の割増倍率 |
 | `確定` / `確定 希望` / `確定 2` | 案を保存しスタッフへ通知 |
+| `人件費予算 200000` | 月次人件費予算（円） |
+| `交通費 太郎 500` | 出勤1日あたり交通費 |
+| `深夜時給 太郎 1500` / `残業時給 太郎 1500` | 深夜・残業時給（未設定時は割増倍率から算出） |
+| `手当 太郎 役職手当 5000` | 各種手当（月額。末尾に「出勤」で日額） |
+| `給与 今月` | 全スタッフの月次給与見込み＋予算差額・人件費率 |
+| `給与 太郎` | 個人の時間・基本・深夜/残業・交通・手当・合計 |
+| `実績 太郎 80時間 深夜8 残業4` | 実績時間編集 → 実績給与再計算 |
+| `給与確定 9月` | 月次実績をロック保存（**振込なし**） |
+| `給与明細 太郎 9月` | 明細風表示 |
+| `給与CSV 9月` | `/workspace/payroll_exports/` に CSV 出力 |
 
-各案の指標: 希望休達成・必要人数不足日・総勤務時間・**予定人件費**・公平性。  
-組表本体は **classical_greedy_heuristic**。注目日のみ QAOA Max-Cut 比較フック（週次量子最適化ではない）。
+各案の指標: 希望休達成・必要人数不足日・総勤務時間・**予定人件費（通勤・深夜・残業見込込み）**・公平性。  
+組表本体は **classical_greedy_heuristic**。注目日のみ QAOA Max-Cut 比較フック（週次量子最適化ではない）。  
+給与計算は **classical_payroll_poc**（見込み・明細・CSVまで。銀行振込は行わない）。
 
 スタッフ向け追加: `自分のシフト`（自分の枠のみ）。
+
+設計メモ: [PAYROLL_DESIGN.md](./PAYROLL_DESIGN.md)
 
 店舗データは `stores.json`（または `LINE_STORES_PATH`）に保存されます。
 
@@ -67,12 +80,17 @@ Credit: Powered by OpenQARP
 | `invite_code` | 招待コード（例: `DEMO01`） |
 | `line_user_ids[]` | 登録済みスタッフの LINE userId |
 | `preferences` | 希望休など店舗共有設定 |
-| `members[].hourly_wage` | 時給（予定人件費シミュレーション） |
+| `members[].hourly_wage` | 基本時給 |
+| `members[].night_hourly_wage` / `overtime_hourly_wage` | 深夜・残業時給（null なら倍率から） |
+| `members[].commute_allowance` | 交通費（円/出勤日） |
+| `members[].allowances[]` | 各種手当 `{name, amount, type}` |
 | `members[].max_hours_week` | 週の最大勤務時間（任意） |
 | `members[].available_days` | 勤務可能日（任意・None=全日） |
 | `members[].role` / `skills` | 役割・スキル |
 | `members[].is_manager` | 店長フラグ |
 | `wage_premiums` | 土日・祝日・深夜の割増倍率 |
+| `labor_budget_monthly` | 月次人件費予算 |
+| `payroll_months` / `actual_hours_by_month` | ロック済み給与・実績時間 |
 | `pending_plans` / `confirmed_plan` | 3案キャッシュと確定シフト |
 
 ---
@@ -204,7 +222,10 @@ python examples/community_mina/line_bridge/notify.py --demo --flex
 |----------|------|
 | `stores.py` | 店舗レジストリ（JSON）。作成・招待・登録・マスク表示 |
 | `stores.example.json` | 空のレジストリ雛形 |
-| `webhook_app.py` | Flask webhook。登録／希望休／組表・デモ API |
+| `payroll.py` | 給与計算・見込み・月次ロック・CSV（振込なし） |
+| `plans.py` | シフト3案・総人件費シミュレーション |
+| `PAYROLL_DESIGN.md` | 給与データ構造・計算式の設計メモ |
+| `webhook_app.py` | Flask webhook。登録／希望休／組表／給与・デモ API |
 | `notify.py` | push / reply / **broadcast_to_store** |
 | `shift_messages.py` | 意図パース・組表・テキスト／Flex・接続ステータス |
 | `config.example.env` | 環境変数テンプレ |

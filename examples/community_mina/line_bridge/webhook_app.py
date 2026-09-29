@@ -84,6 +84,22 @@ from stores import (  # noqa: E402
     set_store_wage_premiums,
     staff_profiles_for_store,
 )
+from payroll import (  # noqa: E402
+    build_staff_forecast,
+    export_payroll_csv,
+    find_worker_id,
+    format_budget_status_text,
+    format_month_payroll_text,
+    format_payslip_text,
+    format_staff_payroll_text,
+    get_locked_payslip,
+    lock_month_payroll,
+    month_forecast,
+    parse_month_token,
+    set_actual_hours,
+    set_labor_budget,
+    set_member_payroll_fields,
+)
 
 LOG = logging.getLogger("line_bridge.webhook")
 
@@ -192,7 +208,7 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
         body = note if not ok else (
             f"{note}\n"
             f"店長コマンド: 「シフト3案作って」「今週の人件費見せて」"
-            f"「人件費を下げて再計算」「確定」\n"
+            f"「人件費予算 200000」「給与 今月」「確定」\n"
             f"{POC_BRANDING_COPY}"
         )
         return [{"type": "text", "text": body}]
@@ -314,7 +330,253 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
             ),
         }]
 
-    # ---- set_pref (existing) ----
+    # ---- payroll / budget / commute / allowances / actuals ----
+    def _month_or_err(token):
+        ym = parse_month_token(token)
+        if ym is None:
+            return None, [{
+                "type": "text",
+                "text": f"月の指定が分かりません: {token}\n例: 「今月」「9月」「2026-09」",
+            }]
+        return ym, None
+
+    if kind == "set_labor_budget":
+        store, err = _require_store()
+        if err:
+            return err
+        mgr_err = _require_manager(store)
+        if mgr_err:
+            return mgr_err
+        assert store is not None
+        ok, note, _ = set_labor_budget(store["store_id"], int(intent["budget_yen"]))
+        if ok:
+            sc, store = _scenario_for_user(user_id)
+            now = __import__("datetime").datetime.now().astimezone()
+            fc = month_forecast(store, sc, year=now.year, month=now.month)
+            note = note + "\n\n" + format_budget_status_text(fc, store_name=store.get("store_name"))
+        return [{"type": "text", "text": note}]
+
+    if kind == "set_commute":
+        store, err = _require_store()
+        if err:
+            return err
+        if store is None:
+            return [{"type": "text", "text": need_register_text()}]
+        who = intent.get("who")
+        if who and not is_user_manager(store, user_id):
+            return [{"type": "text", "text": "他人の交通費変更は店長のみです。"}]
+        kwargs = _resolve_who(store, who)
+        ok, note, _ = set_member_payroll_fields(
+            store["store_id"],
+            worker_id=kwargs.get("worker_id"),
+            display_name=kwargs.get("display_name"),
+            commute_allowance=int(intent["commute_allowance"]),
+        )
+        # 本人指定で worker/display 無し → user_id から
+        if not ok and kwargs.get("user_id"):
+            member = get_member(store, user_id) or {}
+            ok, note, _ = set_member_payroll_fields(
+                store["store_id"],
+                worker_id=member.get("worker_id"),
+                commute_allowance=int(intent["commute_allowance"]),
+            )
+        return [{"type": "text", "text": note}]
+
+    if kind == "set_allowance":
+        store, err = _require_store()
+        if err:
+            return err
+        mgr_err = _require_manager(store)
+        if mgr_err:
+            return mgr_err
+        assert store is not None
+        kwargs = _resolve_who(store, intent.get("who"))
+        ok, note, _ = set_member_payroll_fields(
+            store["store_id"],
+            worker_id=kwargs.get("worker_id"),
+            display_name=kwargs.get("display_name"),
+            add_allowance={
+                "name": intent.get("allowance_name") or "手当",
+                "amount": int(intent.get("amount") or 0),
+                "type": intent.get("allowance_type") or "monthly",
+            },
+        )
+        return [{"type": "text", "text": note}]
+
+    if kind in {"set_night_wage", "set_ot_wage"}:
+        store, err = _require_store()
+        if err:
+            return err
+        if store is None:
+            return [{"type": "text", "text": need_register_text()}]
+        who = intent.get("who")
+        if who and not is_user_manager(store, user_id):
+            return [{"type": "text", "text": "他人の時給変更は店長のみです。"}]
+        kwargs = _resolve_who(store, who)
+        field = "night_hourly_wage" if kind == "set_night_wage" else "overtime_hourly_wage"
+        kw = {
+            "worker_id": kwargs.get("worker_id"),
+            "display_name": kwargs.get("display_name"),
+            field: int(intent["hourly_wage"]),
+        }
+        ok, note, _ = set_member_payroll_fields(store["store_id"], **kw)
+        if not ok and kwargs.get("user_id"):
+            member = get_member(store, user_id) or {}
+            kw2 = {"worker_id": member.get("worker_id"), field: int(intent["hourly_wage"])}
+            ok, note, _ = set_member_payroll_fields(store["store_id"], **kw2)
+        return [{"type": "text", "text": note}]
+
+    if kind == "set_actual_hours":
+        store, err = _require_store()
+        if err:
+            return err
+        mgr_err = _require_manager(store)
+        if mgr_err:
+            return mgr_err
+        assert store is not None
+        ym, merr = _month_or_err(intent.get("month") or "今月")
+        if merr:
+            return merr
+        year, month = ym
+        kwargs = _resolve_who(store, intent.get("who"))
+        wid = kwargs.get("worker_id")
+        if not wid and kwargs.get("display_name"):
+            wid = find_worker_id(store, kwargs["display_name"])
+        if not wid:
+            return [{"type": "text", "text": "対象スタッフが見つかりません。"}]
+        if intent.get("actual_hours") is None and intent.get("night_hours") is None and intent.get("ot_hours") is None:
+            return [{
+                "type": "text",
+                "text": "例: 「実績 太郎 80時間」「実績 太郎 80時間 深夜8 残業4」",
+            }]
+        ok, note, store2 = set_actual_hours(
+            store["store_id"],
+            year=year,
+            month=month,
+            worker_id=wid,
+            actual_hours=intent.get("actual_hours"),
+            night_hours=intent.get("night_hours"),
+            ot_hours=intent.get("ot_hours"),
+            work_days=intent.get("work_days"),
+        )
+        if ok and store2:
+            sc, _ = _scenario_for_user(user_id)
+            row = build_staff_forecast(store2, sc, wid, year=year, month=month)
+            if row:
+                note = note + "\n\n" + format_staff_payroll_text(row, store_name=store2.get("store_name"))
+        return [{"type": "text", "text": note}]
+
+    if kind == "payroll_month":
+        store, err = _require_store()
+        if err:
+            return err
+        if store is None:
+            return [{"type": "text", "text": need_register_text()}]
+        ym, merr = _month_or_err(intent.get("month") or "今月")
+        if merr:
+            return merr
+        year, month = ym
+        sc, store = _scenario_for_user(user_id)
+        fc = month_forecast(store, sc, year=year, month=month)
+        body = format_month_payroll_text(fc, store_name=store.get("store_name"))
+        # 予算ダッシュボードも添える
+        body = format_budget_status_text(fc, store_name=store.get("store_name")) + "\n\n" + body
+        if len(body) > 4500:
+            body = body[:4400] + "\n…(省略)"
+        return [{"type": "text", "text": body}]
+
+    if kind == "payroll_staff":
+        store, err = _require_store()
+        if err:
+            return err
+        if store is None:
+            return [{"type": "text", "text": need_register_text()}]
+        ym, merr = _month_or_err(intent.get("month") or "今月")
+        if merr:
+            return merr
+        year, month = ym
+        who = intent.get("who")
+        wid = find_worker_id(store, who)
+        if not wid:
+            # 本人?
+            member = get_member(store, user_id) or {}
+            if who in {member.get("display_name"), member.get("worker_id")}:
+                wid = member.get("worker_id")
+        if not wid:
+            return [{"type": "text", "text": f"{who} が見つかりません。表示名または枠名（A/B/C）で指定してください。"}]
+        sc, store = _scenario_for_user(user_id)
+        row = build_staff_forecast(store, sc, wid, year=year, month=month)
+        if not row:
+            return [{"type": "text", "text": "給与見込みを作れませんでした。"}]
+        return [{"type": "text", "text": format_staff_payroll_text(row, store_name=store.get("store_name"))}]
+
+    if kind == "payroll_lock":
+        store, err = _require_store()
+        if err:
+            return err
+        mgr_err = _require_manager(store)
+        if mgr_err:
+            return mgr_err
+        assert store is not None
+        ym, merr = _month_or_err(intent.get("month") or "今月")
+        if merr:
+            return merr
+        year, month = ym
+        sc, store = _scenario_for_user(user_id)
+        ok, note, _ = lock_month_payroll(store, sc, year=year, month=month, locked_by=user_id)
+        return [{"type": "text", "text": note}]
+
+    if kind == "payroll_payslip":
+        store, err = _require_store()
+        if err:
+            return err
+        if store is None:
+            return [{"type": "text", "text": need_register_text()}]
+        ym, merr = _month_or_err(intent.get("month") or "今月")
+        if merr:
+            return merr
+        year, month = ym
+        who = intent.get("who")
+        wid = find_worker_id(store, who)
+        if not wid:
+            return [{"type": "text", "text": f"{who} が見つかりません。"}]
+        locked = get_locked_payslip(store, wid, year=year, month=month)
+        if locked:
+            return [{"type": "text", "text": format_payslip_text(locked, store_name=store.get("store_name"))}]
+        # 未ロックなら見込み明細
+        sc, store = _scenario_for_user(user_id)
+        row = build_staff_forecast(store, sc, wid, year=year, month=month)
+        if not row:
+            return [{"type": "text", "text": "明細を作れませんでした。"}]
+        # wrap as payslip
+        slip = {
+            "display_name": row["display_name"],
+            "worker_id": wid,
+            "month_key": row["month_key"],
+            "pay": row["current"],
+            "rates": row["rates"],
+        }
+        body = format_payslip_text(slip, store_name=store.get("store_name"))
+        body += "\n（未確定の見込み明細です。「給与確定」でロックできます）"
+        return [{"type": "text", "text": body}]
+
+    if kind == "payroll_csv":
+        store, err = _require_store()
+        if err:
+            return err
+        mgr_err = _require_manager(store)
+        if mgr_err:
+            return mgr_err
+        assert store is not None
+        ym, merr = _month_or_err(intent.get("month") or "今月")
+        if merr:
+            return merr
+        year, month = ym
+        sc, store = _scenario_for_user(user_id)
+        ok, note, path = export_payroll_csv(store, sc, year=year, month=month)
+        return [{"type": "text", "text": note}]
+
+        # ---- set_pref (existing) ----
     if kind == "set_pref":
         store, err = _require_store()
         if err:
@@ -389,6 +651,11 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
         sc, store = _scenario_for_user(user_id)
         summary = labor_cost_summary(sc, store)
         body = format_labor_cost_text(summary, store_name=store.get("store_name"))
+        # 店長には月次予算ダッシュボードも添付
+        if is_user_manager(store, user_id):
+            now = __import__("datetime").datetime.now().astimezone()
+            fc = month_forecast(store, sc, year=now.year, month=now.month)
+            body = format_budget_status_text(fc, store_name=store.get("store_name")) + "\n\n" + body
         return [{"type": "text", "text": body}]
 
     if kind == "confirm_plan":
