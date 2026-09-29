@@ -35,7 +35,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from flask import Flask, jsonify, request
+from flask import Flask, Response, jsonify, redirect, request
 
 _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
@@ -77,6 +77,7 @@ from stores import (  # noqa: E402
     ensure_demo_store,
     get_member,
     get_pending_payroll_lock,
+    get_store,
     get_store_for_user,
     is_user_manager,
     manager_terms_status,
@@ -88,8 +89,30 @@ from stores import (  # noqa: E402
     set_member_profile,
     set_pending_plans,
     set_store_preferred_offs,
+    set_store_subscription,
     set_store_wage_premiums,
     staff_profiles_for_store,
+)
+from billing import (  # noqa: E402
+    FEATURE_GATES,
+    PLAN_FREE,
+    PLAN_PRO,
+    PLAN_STANDARD,
+    apply_expiry_if_needed,
+    effective_plan,
+    has_feature,
+    normalize_plan_code,
+    required_feature_for_intent,
+    subscription_summary,
+    upgrade_message,
+)
+from payment_provider import (  # noqa: E402
+    MockPaymentProvider,
+    get_payment_provider,
+    period_end_iso,
+    public_base_url,
+    sign_payload,
+    verify_signature,
 )
 from terms import CAUTION_TEXT, PAYROLL_CONFIRMATION, caution_prompt  # noqa: E402
 from line_ui import (  # noqa: E402
@@ -100,9 +123,11 @@ from line_ui import (  # noqa: E402
     consent_agree_items,
     context_menu_for,
     guest_menu_items,
+    legal_links_text,
     manager_menu_items,
     payroll_confirm_items,
     payroll_menu_messages,
+    plan_menu_messages,
     postback_to_intent,
     pref_picker_messages,
     staff_mgmt_messages,
@@ -186,6 +211,42 @@ def _menu_or_consent(user_id: str, store: dict[str, Any]) -> list[dict[str, Any]
     )
 
 
+
+
+def _feature_gate(store: dict[str, Any] | None, intent: str) -> list[dict[str, Any]] | None:
+    """Return upgrade messages if intent requires a paid feature."""
+    feat = required_feature_for_intent(intent)
+    if not feat:
+        return None
+    # refresh expiry without deleting data
+    if store and apply_expiry_if_needed is not None:
+        patch = apply_expiry_if_needed(store)
+        if patch and store.get("store_id"):
+            set_store_subscription(store["store_id"], **patch)
+            store = get_store(store["store_id"]) or store
+    if has_feature(store, feat):
+        return None
+    return _decorate_menu(
+        (store or {}).get("_gate_user") or "",
+        [{"type": "text", "text": upgrade_message(feat, store)}],
+    ) if False else [{"type": "text", "text": upgrade_message(feat, store)}]
+
+
+def _checkout_urls_for_store(store_id: str, user_id: str) -> dict[str, str]:
+    """Best-effort prebuilt checkout URLs (mock/stripe). Failures → empty."""
+    out: dict[str, str] = {}
+    provider = get_payment_provider()
+    for plan in (PLAN_STANDARD, PLAN_PRO):
+        try:
+            sess = provider.create_checkout_session(
+                store_id=store_id, plan=plan, user_id=user_id
+            )
+            out[plan] = sess.checkout_url
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("checkout session create failed plan=%s: %s", plan, exc)
+    return out
+
+
 def handle_postback_message(user_id: str, data: str) -> list[dict[str, Any]]:
     """postback data → messages (reuses text intent dispatch)."""
     intent = postback_to_intent(data)
@@ -217,7 +278,14 @@ def handle_postback_message(user_id: str, data: str) -> list[dict[str, Any]]:
         "staff_mgmt": "スタッフ管理",
         "payroll_menu": "人件費・給与",
         "month_status": "今月の状況",
+        "show_plans": "料金プラン",
+        "legal_links": "利用規約",
     }
+    if kind == "subscribe":
+        plan = intent.get("plan") or ""
+        return handle_text_message(user_id, f"申し込む {plan}".strip())
+    if kind == "subscribe_free":
+        return handle_text_message(user_id, "申し込む フリー")
     if kind == "confirm_plan":
         sel = intent.get("selector") or ""
         return handle_text_message(user_id, f"確定 {sel}".strip())
@@ -308,7 +376,105 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
         blocked = _menu_or_consent(user_id, store)
         if blocked:
             return blocked
+        gate = _feature_gate(store, "payroll_menu")
+        if gate:
+            return _decorate_menu(user_id, gate)
         return payroll_menu_messages()
+
+    if kind == "show_plans":
+        store = get_store_for_user(user_id)
+        if store is None:
+            return _decorate_menu(user_id, [{"type": "text", "text": need_register_text()}])
+        if is_user_manager(store, user_id):
+            blocked = _menu_or_consent(user_id, store)
+            if blocked:
+                return blocked
+        urls = {}
+        if is_user_manager(store, user_id):
+            urls = _checkout_urls_for_store(store["store_id"], user_id)
+        return plan_menu_messages(store=store, checkout_urls=urls)
+
+    if kind == "legal_links":
+        return _decorate_menu(
+            user_id,
+            [{"type": "text", "text": legal_links_text(base_url=public_base_url())}],
+        )
+
+    if kind == "subscribe_incomplete":
+        return _decorate_menu(
+            user_id,
+            [{"type": "text", "text": intent.get("hint") or "例: 「申し込む スタンダード」"}],
+        )
+
+    if kind == "subscribe_free":
+        store = get_store_for_user(user_id)
+        if store is None:
+            return _decorate_menu(user_id, [{"type": "text", "text": need_register_text()}])
+        mgr_err = None
+        if not is_user_manager(store, user_id):
+            return [{"type": "text", "text": "プラン変更は店長のみです。"}]
+        blocked = _menu_or_consent(user_id, store)
+        if blocked:
+            return blocked
+        # Downgrade entitlement to FREE without deleting data
+        set_store_subscription(
+            store["store_id"],
+            plan=PLAN_FREE,
+            subscription_status="none",
+            current_period_end=None,
+        )
+        store = get_store(store["store_id"]) or store
+        return _decorate_menu(
+            user_id,
+            [{
+                "type": "text",
+                "text": (
+                    "フリープランに切り替えました。有料機能は利用できませんが、"
+                    "店舗・スタッフ・シフト・給与データは保持されます。\n"
+                    "「プラン」で再度お申し込みできます。"
+                ),
+            }],
+        )
+
+    if kind == "subscribe":
+        store = get_store_for_user(user_id)
+        if store is None:
+            return _decorate_menu(user_id, [{"type": "text", "text": need_register_text()}])
+        if not is_user_manager(store, user_id):
+            return [{"type": "text", "text": "お申し込みは店長のみです。"}]
+        blocked = _menu_or_consent(user_id, store)
+        if blocked:
+            return blocked
+        plan = normalize_plan_code(intent.get("plan"))
+        if plan == PLAN_FREE:
+            return handle_text_message(user_id, "申し込む フリー")
+        try:
+            provider = get_payment_provider()
+            sess = provider.create_checkout_session(
+                store_id=store["store_id"], plan=plan, user_id=user_id
+            )
+        except Exception as exc:  # noqa: BLE001
+            LOG.exception("checkout create failed")
+            return _decorate_menu(
+                user_id,
+                [{"type": "text", "text": f"決済セッションを開始できませんでした: {exc}"}],
+            )
+        body = (
+            f"【{plan}】のお申し込み\n"
+            f"外部決済ページを開いてください（LINE IAP の定期課金は使いません）。\n"
+            f"{sess.checkout_url}\n\n"
+            "支払い完了後、成功 webhook で店舗プランが有効化されます。"
+            "完了画面から LINE / ミニアプリに戻れます。"
+        )
+        # Prefer URI button via flex
+        from line_ui import build_plans_menu_flex
+        flex = build_plans_menu_flex(
+            store=store, checkout_urls={plan: sess.checkout_url}
+        )
+        return attach_quick_reply_to_last(
+            [{"type": "text", "text": body}, flex],
+            manager_menu_items(),
+        )
 
     if kind == "month_status":
         # 今月の給与＋予算ダッシュボード（既存 payroll_month を再利用）
@@ -394,6 +560,18 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
         mgr_err = _require_manager(store)
         if mgr_err:
             return mgr_err
+        gate = _feature_gate(store, "payroll_lock_confirm")
+        if gate:
+            return _decorate_menu(user_id, gate)
+        gate = _feature_gate(store, "payroll_lock")
+        if gate:
+            return _decorate_menu(user_id, gate)
+        gate = _feature_gate(store, "payroll_csv")
+        if gate:
+            return _decorate_menu(user_id, gate)
+        gate = _feature_gate(store, "payroll_month")
+        if gate:
+            return _decorate_menu(user_id, gate)
         assert store is not None
         pending = get_pending_payroll_lock(store, user_id)
         if not pending:
@@ -607,6 +785,9 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
         mgr_err = _require_manager(store)
         if mgr_err:
             return mgr_err
+        gate = _feature_gate(store, "set_budget")
+        if gate:
+            return _decorate_menu(user_id, gate)
         assert store is not None
         ok, note, _ = set_labor_budget(store["store_id"], int(intent["budget_yen"]))
         if ok:
@@ -626,6 +807,9 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
             mgr_err = _require_manager(store)
             if mgr_err:
                 return mgr_err
+        gate = _feature_gate(store, "set_commute")
+        if gate:
+            return _decorate_menu(user_id, gate)
         who = intent.get("who")
         if who and not is_user_manager(store, user_id):
             return [{"type": "text", "text": "他人の交通費変更は店長のみです。"}]
@@ -653,6 +837,12 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
         mgr_err = _require_manager(store)
         if mgr_err:
             return mgr_err
+        gate = _feature_gate(store, "set_allowance")
+        if gate:
+            return _decorate_menu(user_id, gate)
+        gate = _feature_gate(store, "set_commute")
+        if gate:
+            return _decorate_menu(user_id, gate)
         assert store is not None
         kwargs = _resolve_who(store, intent.get("who"))
         ok, note, _ = set_member_payroll_fields(
@@ -677,6 +867,9 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
             mgr_err = _require_manager(store)
             if mgr_err:
                 return mgr_err
+        gate = _feature_gate(store, "set_night_wage")
+        if gate:
+            return _decorate_menu(user_id, gate)
         who = intent.get("who")
         if who and not is_user_manager(store, user_id):
             return [{"type": "text", "text": "他人の時給変更は店長のみです。"}]
@@ -701,6 +894,9 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
         mgr_err = _require_manager(store)
         if mgr_err:
             return mgr_err
+        gate = _feature_gate(store, "set_actual_hours")
+        if gate:
+            return _decorate_menu(user_id, gate)
         assert store is not None
         ym, merr = _month_or_err(intent.get("month") or "今月")
         if merr:
@@ -804,6 +1000,9 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
         mgr_err = _require_manager(store)
         if mgr_err:
             return mgr_err
+        gate = _feature_gate(store, "payroll_staff")
+        if gate:
+            return _decorate_menu(user_id, gate)
         assert store is not None
         ym, merr = _month_or_err(intent.get("month") or "今月")
         if merr:
@@ -828,6 +1027,9 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
             mgr_err = _require_manager(store)
             if mgr_err:
                 return mgr_err
+        gate = _feature_gate(store, "payslip")
+        if gate:
+            return _decorate_menu(user_id, gate)
         ym, merr = _month_or_err(intent.get("month") or "今月")
         if merr:
             return merr
@@ -934,6 +1136,9 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
         if mgr_err:
             return mgr_err
         assert store is not None
+        gate = _feature_gate(store, kind)
+        if gate:
+            return _decorate_menu(user_id, gate)
         sc, store = _scenario_for_user(user_id)
         budget = intent.get("budget_yen") if kind == "replan_budget" else None
         if kind == "replan_lower_cost" or kind == "replan_budget":
@@ -944,6 +1149,13 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
         else:
             bundle = generate_three_plans(sc, store)
             header = "シフト3案を作りました（古典ソルバの重み違い）。"
+        if not has_feature(store, "qaoa_compare"):
+            bundle = dict(bundle)
+            bundle["quantum_compare"] = {
+                "available": False,
+                "skipped": True,
+                "reason": "QAOA比較はプロプラン機能です",
+            }
         set_pending_plans(store["store_id"], bundle_for_storage(bundle))
         # refresh store name
         store = get_store_for_user(user_id) or store
@@ -968,6 +1180,9 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
             mgr_err = _require_manager(store)
             if mgr_err:
                 return mgr_err
+        gate = _feature_gate(store, "show_labor_cost")
+        if gate:
+            return _decorate_menu(user_id, gate)
         sc, store = _scenario_for_user(user_id)
         summary = labor_cost_summary(sc, store)
         body = format_labor_cost_text(summary, store_name=store.get("store_name"))
@@ -1194,6 +1409,11 @@ def index():
                 "health": "GET /health",
                 "demo_message": "POST /demo/message",
                 "stores": "GET /stores",
+                "billing_checkout": "GET /billing/checkout",
+                "billing_webhook": "POST /billing/webhook",
+                "billing_success": "GET /billing/success",
+                "miniapp": "GET /miniapp",
+                "legal_terms": "GET /legal/terms",
             },
             "note": (
                 "販売時は顧客の LINE 公式を使う想定です。"
@@ -1244,6 +1464,252 @@ def stores_list():
             }
         )
     return jsonify({"ok": True, "stores": out})
+
+
+
+
+@app.get("/billing/checkout")
+def billing_checkout():
+    """External checkout page (Mock provider completes here)."""
+    session_id = (request.args.get("session_id") or "").strip()
+    provider = get_payment_provider()
+    sess = provider.get_session(session_id) if session_id else None
+    if not sess:
+        return (
+            "<!doctype html><html><body><h1>Checkout session not found</h1>"
+            "<p><a href='/miniapp'>ミニアプリへ戻る</a></p></body></html>"
+        ), 404
+    plan = sess.get("plan")
+    amount = sess.get("amount_yen")
+    store_id = sess.get("store_id")
+    # Mock: form posts to mock-pay which fires signed webhook then redirects success
+    html = f"""<!doctype html>
+<html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>お申し込み | {plan}</title>
+<style>
+body{{font-family:system-ui,sans-serif;max-width:480px;margin:2rem auto;padding:0 1rem;color:#0f172a}}
+.card{{border:1px solid #e2e8f0;border-radius:12px;padding:1.25rem;background:#f8fafc}}
+.btn{{display:inline-block;background:#2563eb;color:#fff;padding:.75rem 1.25rem;border-radius:8px;text-decoration:none;border:0;font-size:1rem;cursor:pointer}}
+.muted{{color:#64748b;font-size:.85rem}}
+</style></head><body>
+<h1>料金プランお申し込み</h1>
+<div class="card">
+<p><strong>{plan}</strong> — ¥{amount:,}/月</p>
+<p class="muted">店舗ID: {store_id}</p>
+<p class="muted">LINE Mini App IAP は都度課金のみのため、定期プランは外部決済（Payment Provider）を使います。</p>
+<form method="post" action="/billing/mock-pay">
+  <input type="hidden" name="session_id" value="{session_id}"/>
+  <button class="btn" type="submit">支払いを完了する（デモ）</button>
+</form>
+<p class="muted" style="margin-top:1rem"><a href="{sess.get('cancel_url') or '/billing/cancel'}">キャンセル</a></p>
+</div>
+<p class="muted">本番では Stripe 等の Checkout にリダイレクトされます。</p>
+</body></html>"""
+    return html
+
+
+@app.post("/billing/mock-pay")
+def billing_mock_pay():
+    """Demo complete: sign + POST internal webhook, then redirect success."""
+    session_id = ""
+    if request.form:
+        session_id = (request.form.get("session_id") or "").strip()
+    elif request.is_json and request.json:
+        session_id = str(request.json.get("session_id") or "").strip()
+    else:
+        session_id = (request.args.get("session_id") or "").strip()
+    provider = get_payment_provider()
+    if not isinstance(provider, MockPaymentProvider):
+        # still allow mock completion for local sessions
+        provider = MockPaymentProvider()
+    try:
+        body = provider.build_success_webhook_body(session_id)
+    except KeyError:
+        return jsonify({"ok": False, "error": "session not found"}), 404
+    sig = sign_payload(body)
+    # apply locally (same process)
+    from flask import current_app
+    with current_app.test_request_context(
+        "/billing/webhook",
+        method="POST",
+        data=body,
+        headers={"Content-Type": "application/json", "X-Payment-Signature": sig},
+    ):
+        # call handler logic directly
+        result, status = _apply_payment_webhook(body, {"X-Payment-Signature": sig})
+    sess = provider.get_session(session_id) or {}
+    success = sess.get("success_url") or f"/billing/success?session_id={session_id}"
+    if status >= 400:
+        return jsonify({"ok": False, "result": result}), status
+    return redirect(success, code=302)
+
+
+def _apply_payment_webhook(body: bytes, headers: dict[str, str]) -> tuple[dict, int]:
+    provider = get_payment_provider()
+    try:
+        # Prefer mock parse for HMAC; stripe provider also accepts our HMAC
+        try:
+            event = provider.parse_webhook(body, {k: headers.get(k) for k in headers})
+        except PermissionError:
+            # fallback mock verifier
+            event = MockPaymentProvider().parse_webhook(body, headers)
+    except PermissionError as exc:
+        return {"ok": False, "error": str(exc)}, 403
+    except Exception as exc:  # noqa: BLE001
+        LOG.exception("payment webhook parse failed")
+        return {"ok": False, "error": str(exc)}, 400
+
+    store_id = (event.get("store_id") or "").strip()
+    plan = normalize_plan_code(event.get("plan"))
+    if not store_id or plan == PLAN_FREE:
+        return {"ok": False, "error": "store_id/plan required"}, 400
+    store = get_store(store_id)
+    if not store:
+        return {"ok": False, "error": "store not found"}, 404
+
+    etype = (event.get("type") or "").lower()
+    status = (event.get("status") or "active").lower()
+
+    if etype in {"customer.subscription.deleted", "invoice.payment_failed"} or status in {
+        "canceled", "past_due", "expired",
+    }:
+        # Disable paid features only — never delete operational data
+        new_status = "past_due" if "fail" in etype or status == "past_due" else status
+        if new_status not in {"past_due", "canceled", "expired"}:
+            new_status = "canceled"
+        updated = set_store_subscription(
+            store_id,
+            subscription_status=new_status,
+            # keep plan / period / customer for audit; entitlement uses status
+        )
+        LOG.info("subscription disabled store=%s status=%s (data retained)", store_id, new_status)
+        return {
+            "ok": True,
+            "store_id": store_id,
+            "subscription_status": new_status,
+            "plan": (updated or {}).get("plan"),
+            "data_deleted": False,
+        }, 200
+
+    # success → attach plan
+    updated = set_store_subscription(
+        store_id,
+        plan=plan,
+        subscription_status="active",
+        started_at=(store.get("started_at") or None),
+        current_period_end=period_end_iso(1),
+        payment_customer_id=event.get("customer_id"),
+    )
+    if updated and not updated.get("started_at"):
+        from billing import now_local
+        set_store_subscription(store_id, started_at=now_local().isoformat(timespec="seconds"))
+        updated = get_store(store_id)
+    LOG.info("subscription activated store=%s plan=%s", store_id, plan)
+    return {
+        "ok": True,
+        "store_id": store_id,
+        "plan": plan,
+        "subscription_status": "active",
+        "current_period_end": (updated or {}).get("current_period_end"),
+        "payment_customer_id": (updated or {}).get("payment_customer_id"),
+    }, 200
+
+
+@app.post("/billing/webhook")
+def billing_webhook():
+    """Payment Provider success / lifecycle webhook → attach or revoke plan on store_id."""
+    body = request.get_data()
+    headers = {k: v for k, v in request.headers.items()}
+    result, status = _apply_payment_webhook(body, headers)
+    return jsonify(result), status
+
+
+@app.get("/billing/success")
+def billing_success():
+    session_id = (request.args.get("session_id") or "").strip()
+    provider = get_payment_provider()
+    sess = provider.get_session(session_id) if session_id else None
+    store = get_store((sess or {}).get("store_id") or "") if sess else None
+    plan = (sess or {}).get("plan") or (store or {}).get("plan") or ""
+    summary = subscription_summary(store) if store else {}
+    html = f"""<!doctype html>
+<html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>申し込み完了</title>
+<style>
+body{{font-family:system-ui,sans-serif;max-width:480px;margin:2rem auto;padding:0 1rem}}
+.card{{border:1px solid #bbf7d0;background:#f0fdf4;border-radius:12px;padding:1.25rem}}
+.btn{{display:inline-block;margin:.4rem .4rem 0 0;background:#16a34a;color:#fff;padding:.7rem 1rem;border-radius:8px;text-decoration:none}}
+.btn.secondary{{background:#64748b}}
+</style></head><body>
+<h1>お申し込み完了</h1>
+<div class="card">
+<p>プラン <strong>{plan}</strong> を店舗に適用しました。</p>
+<p>ステータス: {summary.get('subscription_status') or 'active'}</p>
+<p>有効期限: {summary.get('current_period_end') or '—'}</p>
+</div>
+<p>
+  <a class="btn" href="/miniapp">ミニアプリへ戻る（スタブ）</a>
+  <a class="btn secondary" href="https://line.me/R/nv/chat">LINE に戻る</a>
+</p>
+<p style="color:#64748b;font-size:.85rem">LINE トークで「プラン」と送ると現在の契約を確認できます。</p>
+</body></html>"""
+    return html
+
+
+@app.get("/billing/cancel")
+def billing_cancel():
+    return (
+        "<!doctype html><html lang='ja'><body style='font-family:system-ui;max-width:480px;margin:2rem auto'>"
+        "<h1>申し込みをキャンセルしました</h1>"
+        "<p>店舗データは変更されていません。</p>"
+        "<p><a href='/miniapp'>ミニアプリへ</a> · <a href='https://line.me/R/nv/chat'>LINE に戻る</a></p>"
+        "</body></html>"
+    )
+
+
+@app.get("/miniapp")
+def miniapp_stub():
+    """LINE Mini App stub — return to chat / show plan status hint."""
+    return (
+        "<!doctype html><html lang='ja'><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<title>OpenQARP Mini App Stub</title></head>"
+        "<body style='font-family:system-ui;max-width:480px;margin:2rem auto;padding:0 1rem'>"
+        "<h1>ミニアプリ（スタブ）</h1>"
+        "<p>本番では LINE Mini App の LIFF 画面に置き換えます。</p>"
+        "<p>定期課金は Mini App IAP ではなく外部 Payment Provider を使用します。</p>"
+        "<p><a href='https://line.me/R/nv/chat'>LINE トークに戻る</a></p>"
+        "<p><a href='/legal/terms'>利用規約</a> · "
+        "<a href='/legal/privacy'>プライバシー</a> · "
+        "<a href='/legal/cancel-refund'>解約・返金</a></p>"
+        "</body></html>"
+    )
+
+
+def _read_legal_md(name: str) -> str:
+    p = _HERE / name
+    if not p.exists():
+        return f"# {name}\n\n（ドラフト未配置）\n"
+    return p.read_text(encoding="utf-8")
+
+
+@app.get("/legal/terms")
+def legal_terms():
+    body = _read_legal_md("利用規約.md")
+    return Response(f"<pre style='white-space:pre-wrap;font-family:system-ui;max-width:720px;margin:1rem auto'>{body}</pre>", mimetype="text/html")
+
+
+@app.get("/legal/privacy")
+def legal_privacy():
+    body = _read_legal_md("プライバシーポリシー.md")
+    return Response(f"<pre style='white-space:pre-wrap;font-family:system-ui;max-width:720px;margin:1rem auto'>{body}</pre>", mimetype="text/html")
+
+
+@app.get("/legal/cancel-refund")
+def legal_cancel_refund():
+    body = _read_legal_md("解約・返金ポリシー.md")
+    return Response(f"<pre style='white-space:pre-wrap;font-family:system-ui;max-width:720px;margin:1rem auto'>{body}</pre>", mimetype="text/html")
+
 
 
 @app.post("/webhook")

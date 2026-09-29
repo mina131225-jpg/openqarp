@@ -77,6 +77,24 @@ curl -s -X POST http://127.0.0.1:8080/demo/message \
   -d '{"postback":"v=1&action=manager_menu","userId":"Udemo"}'
 ```
 
+
+## 料金プラン（マネタイズ）
+
+LINE Mini App の IAP は **都度課金のみ**のため、定期プランは **抽象化した Payment Provider + 外部チェックアウト + 成功 webhook** で `store_id` にプランを紐付けます（IAP 定期の偽装はしません）。
+
+| プラン | 内容 | 月額 |
+|--------|------|------|
+| FREE | 1店舗・スタッフ5名・基本シフト | ¥0 |
+| STANDARD | スタッフ20名・3案・人件費最適化・給与/CSV | ¥980 |
+| PRO | 大規模・フル最適化・QAOA比較・高度人件費・複数店舗 | ¥2980 |
+
+- 新規店舗は **14日トライアル**（残り日数を「プラン」で表示）
+- LINE: `プラン` / `料金プラン` / メニュー「料金プラン」→ 申し込む → 決済ページ → webhook → プラン適用 → LINE/ミニアプリへ戻る
+- 解約・期限切れ・失敗時: **有料機能のみ停止。店舗/スタッフ/シフト/給与データは削除しない**
+- 店長UIから利用規約・プライバシー・解約/返金へリンク
+
+環境変数: `PUBLIC_BASE_URL`, `PAYMENT_PROVIDER`, `PAYMENT_WEBHOOK_SECRET`（任意で Stripe 系）。詳細は `config.example.env`。
+
 ## 店長向けコマンド（LINE 日本語）
 
 | コマンド | 内容 |
@@ -132,6 +150,7 @@ curl -s -X POST http://127.0.0.1:8080/demo/message \
 | `labor_budget_monthly` | 月次人件費予算 |
 | `payroll_months` / `actual_hours_by_month` | ロック済み給与・実績時間 |
 | `pending_plans` / `confirmed_plan` | 3案キャッシュと確定シフト |
+| `plan` / `subscription_status` / `started_at` / `current_period_end` / `payment_customer_id` | 料金プラン・契約状態 |
 
 ---
 

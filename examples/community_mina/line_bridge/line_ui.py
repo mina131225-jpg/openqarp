@@ -90,6 +90,17 @@ def postback_to_intent(data: str) -> dict[str, Any] | None:
         return {"intent": "set_pref_incomplete", "raw": data, "hint": "下の曜日ボタン、または「希望休 日曜」と送ってください。"}
     if action == "show_terms":
         return {"intent": "show_terms", "raw": data, "via": "postback"}
+    if action in {"show_plans", "pricing", "plan_menu"}:
+        return {"intent": "show_plans", "raw": data, "via": "postback"}
+    if action == "subscribe":
+        plan = (p.get("plan") or p.get("p") or "").strip().upper() or None
+        if not plan:
+            return {"intent": "subscribe_incomplete", "raw": data, "hint": "プランを選んでください。", "via": "postback"}
+        if plan == "FREE":
+            return {"intent": "subscribe_free", "raw": data, "plan": "FREE", "via": "postback"}
+        return {"intent": "subscribe", "raw": data, "plan": plan, "via": "postback"}
+    if action == "legal_links":
+        return {"intent": "legal_links", "raw": data, "via": "postback"}
     return None
 
 
@@ -187,6 +198,7 @@ def manager_menu_items() -> list[dict[str, Any]]:
         qr_postback("シフト作成", encode_postback(action="make_three_plans"), display_text="シフト作成"),
         qr_postback("人件費・給与", encode_postback(action="payroll_menu"), display_text="人件費・給与"),
         qr_postback("今月の状況", encode_postback(action="month_status"), display_text="今月の状況"),
+        qr_postback("料金プラン", encode_postback(action="show_plans"), display_text="料金プラン"),
     ]
 
 
@@ -258,6 +270,7 @@ def build_manager_menu_flex(*, store_name: str | None = None) -> dict[str, Any]:
         flex_button_postback("シフト作成", encode_postback(action="make_three_plans"), style="primary", display_text="シフト作成"),
         flex_button_postback("人件費・給与", encode_postback(action="payroll_menu"), style="secondary", display_text="人件費・給与"),
         flex_button_postback("今月の状況", encode_postback(action="month_status"), style="secondary", display_text="今月の状況"),
+        flex_button_postback("料金プラン", encode_postback(action="show_plans"), style="primary", display_text="料金プラン"),
     ]
     return {
         "type": "flex",
@@ -413,6 +426,8 @@ def store_settings_messages(*, store: dict[str, Any] | None) -> list[dict[str, A
         "店舗設定",
         [
             ("注意事項・同意", encode_postback(action="show_terms"), "注意事項"),
+            ("料金プラン", encode_postback(action="show_plans"), "料金プラン"),
+            ("規約・プライバシー等", encode_postback(action="legal_links"), "利用規約"),
             ("シフト作成へ", encode_postback(action="make_three_plans"), "シフト作成"),
             ("店長メニュー", encode_postback(action="manager_menu"), "メニュー"),
         ],
@@ -503,4 +518,127 @@ def confirm_plan_button(plan_key: str, plan_label: str) -> dict[str, Any]:
         style="primary",
         display_text=f"確定 {plan_label}",
         height="md",
+    )
+
+
+def flex_button_uri(label: str, uri: str, *, style: str = "primary", height: str = "sm") -> dict[str, Any]:
+    return {
+        "type": "button",
+        "style": style,
+        "height": height,
+        "action": {"type": "uri", "label": label[:40], "uri": uri},
+        "margin": "sm",
+    }
+
+
+def build_plans_menu_flex(*, store: dict | None = None, checkout_urls: dict[str, str] | None = None) -> dict[str, Any]:
+    """Current plan + feature list + subscribe buttons (uri or postback)."""
+    from billing import PLAN_CATALOG, PLAN_ORDER, subscription_summary
+
+    summary = subscription_summary(store)
+    title = "料金プラン"
+    status_line = f"{summary['effective_label']} / {summary['subscription_status']}"
+    if summary.get("subscription_status") == "trialing" and summary.get("days_remaining") is not None:
+        status_line += f"（トライアル残り {summary['days_remaining']} 日）"
+
+    body: list[dict[str, Any]] = [
+        {"type": "text", "text": status_line, "size": "sm", "color": "#0f172a", "wrap": True, "weight": "bold"},
+        {
+            "type": "text",
+            "text": "LINE IAP は都度課金のみのため、定期プランは外部決済です。",
+            "size": "xxs",
+            "color": "#64748b",
+            "wrap": True,
+            "margin": "md",
+        },
+    ]
+    for code in PLAN_ORDER:
+        c = PLAN_CATALOG[code]
+        price = "¥0" if c["price_yen_month"] == 0 else f"¥{c['price_yen_month']:,}/月"
+        mark = "【利用中】" if code == summary["effective_plan"] else ""
+        body.append(
+            {
+                "type": "text",
+                "text": f"{c['label']} {price} {mark}\n{c['blurb']}".strip(),
+                "size": "xs",
+                "color": "#334155",
+                "wrap": True,
+                "margin": "md",
+            }
+        )
+        if code in {"STANDARD", "PRO"} and code != summary["effective_plan"]:
+            url = (checkout_urls or {}).get(code)
+            if url:
+                body.append(flex_button_uri(f"{c['label']}に申し込む", url, style="primary"))
+            else:
+                body.append(
+                    flex_button_postback(
+                        f"{c['label']}に申し込む",
+                        encode_postback(action="subscribe", plan=code),
+                        style="primary",
+                        display_text=f"申し込む {c['label']}",
+                    )
+                )
+    body.append(
+        flex_button_postback(
+            "規約・解約・返金",
+            encode_postback(action="legal_links"),
+            style="secondary",
+            display_text="利用規約",
+        )
+    )
+    return {
+        "type": "flex",
+        "altText": f"{title}｜{POC_BRANDING_COPY}",
+        "contents": {
+            "type": "bubble",
+            "size": "mega",
+            "header": {
+                "type": "box",
+                "layout": "vertical",
+                "contents": [
+                    {"type": "text", "text": title, "weight": "bold", "size": "lg", "color": "#0f172a"},
+                ],
+                "paddingAll": "14px",
+                "backgroundColor": "#f8fafc",
+            },
+            "body": {
+                "type": "box",
+                "layout": "vertical",
+                "contents": body,
+                "spacing": "sm",
+                "paddingAll": "14px",
+            },
+            "footer": {
+                "type": "box",
+                "layout": "vertical",
+                "contents": [_footer_note()],
+                "paddingAll": "12px",
+            },
+        },
+    }
+
+
+def plan_menu_messages(*, store: dict | None, checkout_urls: dict[str, str] | None = None) -> list[dict[str, Any]]:
+    from billing import format_plan_status_text
+
+    text_msg = {"type": "text", "text": format_plan_status_text(store)}
+    flex = build_plans_menu_flex(store=store, checkout_urls=checkout_urls)
+    return attach_quick_reply_to_last([text_msg, flex], manager_menu_items())
+
+
+def legal_links_text(*, base_url: str = "") -> str:
+    root = (base_url or "").rstrip("/")
+    terms = f"{root}/legal/terms" if root else "利用規約.md"
+    privacy = f"{root}/legal/privacy" if root else "プライバシーポリシー.md"
+    cancel = f"{root}/legal/cancel-refund" if root else "解約・返金ポリシー.md"
+    return (
+        "【規約・プライバシー・解約/返金】\n"
+        f"・利用規約: {terms}\n"
+        f"・プライバシーポリシー: {privacy}\n"
+        f"・解約・返金: {cancel}\n"
+        "\n"
+        "解約や期限切れ後も、店舗・スタッフ・シフト・給与データは削除しません。"
+        "有料機能のみ利用できなくなります。\n"
+        "※ LINE Mini App IAP による定期課金は行いません（都度課金のみのため外部決済）。"
     )

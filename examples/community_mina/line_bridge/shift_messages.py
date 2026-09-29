@@ -174,6 +174,35 @@ def parse_user_intent(text: str) -> dict[str, Any]:
     if re.fullmatch(r"今月の状況|今月の状態|ダッシュボード", normalized):
         return {"intent": "month_status", "raw": raw}
 
+    # --- 料金プラン / 申し込み（外部チェックアウト。LINE IAP 定期は使わない） ---
+    if re.fullmatch(r"プラン|料金プラン|料金|サブスク|サブスクリプション", normalized):
+        return {"intent": "show_plans", "raw": raw}
+    m_sub = re.search(
+        r"^(?:申し込む|申込む|申込|アップグレード|契約)"
+        r"\s*(?:[:：]\s*)?"
+        r"(?P<plan>スタンダード|標準|STANDARD|standard|プロ|PRO|pro|フリー|無料|FREE|free)?"
+        r"\s*$",
+        normalized,
+        re.I,
+    )
+    if m_sub:
+        raw_plan = (m_sub.group("plan") or "").strip()
+        plan_map = {
+            "スタンダード": "STANDARD", "標準": "STANDARD", "STANDARD": "STANDARD", "standard": "STANDARD",
+            "プロ": "PRO", "PRO": "PRO", "pro": "PRO",
+            "フリー": "FREE", "無料": "FREE", "FREE": "FREE", "free": "FREE",
+        }
+        plan = plan_map.get(raw_plan) if raw_plan else None
+        if plan == "FREE":
+            return {"intent": "subscribe_free", "raw": raw, "plan": "FREE"}
+        if plan:
+            return {"intent": "subscribe", "raw": raw, "plan": plan}
+        return {
+            "intent": "subscribe_incomplete",
+            "raw": raw,
+            "hint": "例: 「申し込む スタンダード」または「申し込む プロ」",
+        }
+
     # --- 店長登録 ---
     m_mgr = re.search(
         r"^(?:店長登録|マネージャー登録|店長に登録)"
@@ -875,6 +904,7 @@ def help_text() -> str:
         "・「店舗作成 青山店」「店長登録 DEMO01」\n"
         "・「人件費予算 200000」「割増 土日 1.25」「太郎さんは週20時間以内」\n"
         "・「確定」「確定 希望」「確定 2」も可\n"
+        "・「プラン」「料金プラン」「申し込む スタンダード」\n"
         "\n"
         "■ 給与見込み（※振込なし）\n"
         "・「給与 今月」「給与確定 9月」「給与CSV 9月」\n"
@@ -939,6 +969,17 @@ def scenario_for_store(store: dict[str, Any] | None) -> dict[str, Any]:
         labels[wid] = dn if dn else wid
     if labels:
         sc["_display_labels"] = labels
+        # プランに応じたスタッフ数: メンバーの worker_id をシナリオ workers に反映
+        member_workers = [w for w in labels.keys() if w]
+        if member_workers:
+            # keep stable order: A,B,C,D then W05...
+            def _wid_key(w: str) -> tuple:
+                if len(w) == 1 and w.isalpha():
+                    return (0, w)
+                return (1, w)
+            ordered = sorted(set(member_workers), key=_wid_key)
+            sc["workers"] = ordered
+            # preferred_offs keys may reference old slots — keep as-is
     # 予定人件費・制約用メタ（ソルバ本体は無視、plans が参照）
     sc["_store_id"] = store.get("store_id")
     return sc

@@ -43,6 +43,13 @@ DEFAULT_OT_MULTIPLIER = 1.25
 MANAGER_OWNER_CODE_ENV = "LINE_STORE_OWNER_CODE"  # optional global owner code
 TERMS_VERSION = "sales-v1"
 
+try:
+    from billing import default_subscription_fields, apply_expiry_if_needed, max_staff_for  # noqa: E402
+except Exception:  # noqa: BLE001
+    default_subscription_fields = None  # type: ignore
+    apply_expiry_if_needed = None  # type: ignore
+    max_staff_for = None  # type: ignore
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
@@ -167,6 +174,13 @@ def create_store(
             "actual_hours_by_month": {},
             "night_hours_per_weekend_shift": 2.0,
             "pending_payroll_locks": {},
+            **(default_subscription_fields(trial=True) if default_subscription_fields else {
+                "plan": "FREE",
+                "subscription_status": "none",
+                "started_at": _now_iso(),
+                "current_period_end": None,
+                "payment_customer_id": None,
+            }),
             "created_at": _now_iso(),
             "updated_at": _now_iso(),
         }
@@ -234,7 +248,7 @@ def _normalize_display_name(name: str | None) -> str | None:
 
 
 def _assign_worker_id(store: dict[str, Any]) -> str | None:
-    """未使用の A/B/C/D 枠を登録順で返す。空きがなければ None。"""
+    """未使用枠を登録順で返す。A/B/C/D の後は W05, W06…。"""
     used = {
         str(m.get("worker_id") or "").strip()
         for m in (store.get("members") or [])
@@ -243,6 +257,12 @@ def _assign_worker_id(store: dict[str, Any]) -> str | None:
     for slot in WORKER_SLOTS:
         if slot not in used:
             return slot
+    i = len(WORKER_SLOTS) + 1
+    while i < 1000:
+        wid = f"W{i:02d}"
+        if wid not in used:
+            return wid
+        i += 1
     return None
 
 
@@ -341,6 +361,27 @@ def _backfill_worker_ids(store: dict[str, Any]) -> bool:
     if not isinstance(store.get("pending_payroll_locks"), dict):
         store["pending_payroll_locks"] = {}
         changed = True
+    # subscription / monetization fields
+    if "plan" not in store or not store.get("plan"):
+        store["plan"] = "FREE"
+        changed = True
+    if "subscription_status" not in store or store.get("subscription_status") is None:
+        store["subscription_status"] = "none"
+        changed = True
+    if "started_at" not in store:
+        store["started_at"] = store.get("created_at") or _now_iso()
+        changed = True
+    if "current_period_end" not in store:
+        store["current_period_end"] = None
+        changed = True
+    if "payment_customer_id" not in store:
+        store["payment_customer_id"] = None
+        changed = True
+    if apply_expiry_if_needed is not None:
+        patch = apply_expiry_if_needed(store)
+        if patch:
+            store.update(patch)
+            changed = True
     return changed
 
 
@@ -410,6 +451,17 @@ def register_user(
 
         already = uid in store.get("line_user_ids", [])
         if not already:
+            # plan staff cap (never deletes existing members)
+            if max_staff_for is not None:
+                cap = int(max_staff_for(store))
+                n_members = len(store.get("members") or [])
+                if n_members >= cap:
+                    return (
+                        False,
+                        f"この店舗のプランではスタッフ上限（{cap}名）に達しています。"
+                        "「プラン」でアップグレードしてください。既存データは削除しません。",
+                        deepcopy(store),
+                    )
             slot = _assign_worker_id(store)
             store.setdefault("line_user_ids", []).append(uid)
             # 最初の登録者を店長に（既存店長がいなければ）
@@ -936,6 +988,25 @@ def create_store_as_manager(
     if len(name) > 40:
         return False, "店舗名は40文字以内にしてください。", None
 
+    # multi-store gate: without PRO, refuse second store (data of current store kept)
+    existing = get_store_for_user(uid)
+    if existing is not None:
+        try:
+            from billing import has_feature, upgrade_message
+        except Exception:  # noqa: BLE001
+            has_feature = None  # type: ignore
+            upgrade_message = None  # type: ignore
+        if has_feature is not None and not has_feature(existing, "multi_store"):
+            msg = (
+                f"既に「{existing.get('store_name')}」に所属しています。"
+                "追加店舗の作成はプロプランの機能です。\n"
+            )
+            if upgrade_message is not None:
+                msg += upgrade_message("multi_store", existing)
+            else:
+                msg += "「プラン」でアップグレードしてください。既存データは削除しません。"
+            return False, msg, existing
+
     rec = create_store(name, invite_code=invite_code)
     ok, note, store = register_manager(
         uid,
@@ -994,6 +1065,59 @@ def set_confirmed_plan(store_id: str, plan: dict[str, Any] | None) -> dict[str, 
         store["updated_at"] = _now_iso()
         _save_unlocked(db)
         return deepcopy(store)
+
+
+
+def set_store_subscription(
+    store_id: str,
+    *,
+    plan: str | None = None,
+    subscription_status: str | None = None,
+    started_at: str | None = None,
+    current_period_end: str | None = None,
+    payment_customer_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Attach / update plan on store_id. Never deletes operational data."""
+    sid = (store_id or "").strip()
+    if not sid:
+        return None
+    with _LOCK:
+        db = _load_unlocked()
+        store = db["stores"].get(sid)
+        if not store:
+            return None
+        _backfill_worker_ids(store)
+        if plan is not None:
+            store["plan"] = str(plan).strip().upper() or store.get("plan") or "FREE"
+        if subscription_status is not None:
+            store["subscription_status"] = str(subscription_status).strip().lower()
+        if started_at is not None:
+            store["started_at"] = started_at
+        if current_period_end is not None:
+            store["current_period_end"] = current_period_end
+        if payment_customer_id is not None:
+            store["payment_customer_id"] = payment_customer_id
+        store["updated_at"] = _now_iso()
+        _save_unlocked(db)
+        return deepcopy(store)
+
+
+def get_store_subscription(store_id: str) -> dict[str, Any] | None:
+    store = get_store(store_id)
+    if not store:
+        return None
+    try:
+        from billing import subscription_summary
+        return subscription_summary(store)
+    except Exception:  # noqa: BLE001
+        return {
+            "store_id": store.get("store_id"),
+            "plan": store.get("plan"),
+            "subscription_status": store.get("subscription_status"),
+            "started_at": store.get("started_at"),
+            "current_period_end": store.get("current_period_end"),
+            "payment_customer_id": store.get("payment_customer_id"),
+        }
 
 
 def ensure_demo_store(
