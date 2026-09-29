@@ -69,22 +69,30 @@ from shift_messages import (  # noqa: E402
     scenario_for_store,
 )
 from stores import (  # noqa: E402
+    acknowledge_manager_terms,
+    clear_pending_payroll_lock,
+    consent_manager_terms,
     create_store_as_manager,
     display_labels_for_store,
     ensure_demo_store,
     get_member,
+    get_pending_payroll_lock,
     get_store_for_user,
     is_user_manager,
+    manager_terms_status,
     register_manager,
     register_user,
     set_confirmed_plan,
     set_member_display_name,
+    set_pending_payroll_lock,
     set_member_profile,
     set_pending_plans,
     set_store_preferred_offs,
     set_store_wage_premiums,
     staff_profiles_for_store,
 )
+from terms import CAUTION_TEXT, PAYROLL_CONFIRMATION, caution_prompt  # noqa: E402
+
 from payroll import (  # noqa: E402
     build_staff_forecast,
     export_payroll_csv,
@@ -158,6 +166,9 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
                     "最初に登録したアカウントで操作してください。"
                 ),
             }]
+        terms = manager_terms_status(store, user_id)
+        if not terms.get("consented"):
+            return [{"type": "text", "text": caution_prompt(acknowledged=bool(terms.get("acknowledged")))}]
         return None
 
     def _resolve_who(store: dict[str, Any], who: str | None) -> dict[str, Any] | None:
@@ -175,6 +186,47 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
                 return {"store_id": store["store_id"], "worker_id": wid}
         # 「太郎さん」のさんなしで再試行は呼び出し側で
         return {"store_id": store["store_id"], "display_name": who}
+
+    # ---- 販売版の注意事項・同意（店長機能の入口） ----
+    if kind == "show_terms":
+        return [{"type": "text", "text": CAUTION_TEXT}]
+
+    if kind in {"ack_terms", "agree"}:
+        store = get_store_for_user(user_id)
+        if store is None:
+            return [{"type": "text", "text": need_register_text()}]
+        if not is_user_manager(store, user_id):
+            return [{"type": "text", "text": "この同意フローは店長のみです。"}]
+        if kind == "ack_terms":
+            ok, note = acknowledge_manager_terms(user_id)
+            return [{"type": "text", "text": note}]
+        # 「同意する」は、未同意なら規約同意、保留中の給与確定があればその確定にも使う。
+        status = manager_terms_status(store, user_id)
+        if not status.get("consented"):
+            ok, note = consent_manager_terms(user_id)
+            return [{"type": "text", "text": note}]
+        pending = get_pending_payroll_lock(store, user_id)
+        if pending:
+            kind = "payroll_lock_confirm"
+        else:
+            return [{"type": "text", "text": "既に同意済みです。店長機能をご利用いただけます。"}]
+
+    if kind == "payroll_lock_confirm":
+        store, err = _require_store()
+        if err:
+            return err
+        mgr_err = _require_manager(store)
+        if mgr_err:
+            return mgr_err
+        assert store is not None
+        pending = get_pending_payroll_lock(store, user_id)
+        if not pending:
+            return [{"type": "text", "text": "先に「給与確定 9月」のように対象月を指定してください。"}]
+        year, month = int(pending["year"]), int(pending["month"])
+        sc, store = _scenario_for_user(user_id)
+        ok, note, _ = lock_month_payroll(store, sc, year=year, month=month, locked_by=user_id)
+        clear_pending_payroll_lock(store["store_id"], user_id)
+        return [{"type": "text", "text": note}]
 
     # ---- register / manager ----
     if kind == "register":
@@ -208,6 +260,7 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
         )
         body = note if not ok else (
             f"{note}\n"
+            f"{CAUTION_TEXT}\n\n"
             f"店長コマンド: 「シフト3案作って」「今週の人件費見せて」"
             f"「人件費予算 200000」「給与 今月」「確定」\n"
             f"{POC_BRANDING_COPY}"
@@ -229,6 +282,7 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
         if ok and store:
             body = (
                 f"{note}\n"
+                f"{CAUTION_TEXT}\n\n"
                 f"店長コマンド: 「シフト3案作って」「給与 今月」「人件費予算 200000」\n"
                 f"{POC_BRANDING_COPY}"
             )
@@ -277,6 +331,10 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
             return err
         if store is None:
             return [{"type": "text", "text": need_register_text()}]
+        if is_user_manager(store, user_id):
+            mgr_err = _require_manager(store)
+            if mgr_err:
+                return mgr_err
         who = intent.get("who")
         # 他人の時給変更は店長のみ
         if who and not is_user_manager(store, user_id):
@@ -304,7 +362,7 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
             member.get("display_name"),
             (display_labels_for_store(store) or {}).get(member.get("worker_id") or ""),
         }
-        if mgr_err and not self_ok:
+        if mgr_err and (is_user_manager(store, user_id) or not self_ok):
             return mgr_err
         kwargs = _resolve_who(store, who)
         ok, note, _ = set_member_profile(
@@ -318,6 +376,10 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
             return err
         if store is None:
             return [{"type": "text", "text": need_register_text()}]
+        if is_user_manager(store, user_id):
+            mgr_err = _require_manager(store)
+            if mgr_err:
+                return mgr_err
         who = intent.get("who")
         if who and not is_user_manager(store, user_id):
             return [{"type": "text", "text": "他人の役割変更は店長のみです。"}]
@@ -379,6 +441,10 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
             return err
         if store is None:
             return [{"type": "text", "text": need_register_text()}]
+        if is_user_manager(store, user_id):
+            mgr_err = _require_manager(store)
+            if mgr_err:
+                return mgr_err
         who = intent.get("who")
         if who and not is_user_manager(store, user_id):
             return [{"type": "text", "text": "他人の交通費変更は店長のみです。"}]
@@ -426,6 +492,10 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
             return err
         if store is None:
             return [{"type": "text", "text": need_register_text()}]
+        if is_user_manager(store, user_id):
+            mgr_err = _require_manager(store)
+            if mgr_err:
+                return mgr_err
         who = intent.get("who")
         if who and not is_user_manager(store, user_id):
             return [{"type": "text", "text": "他人の時給変更は店長のみです。"}]
@@ -489,6 +559,10 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
             return err
         if store is None:
             return [{"type": "text", "text": need_register_text()}]
+        if is_user_manager(store, user_id):
+            mgr_err = _require_manager(store)
+            if mgr_err:
+                return mgr_err
         ym, merr = _month_or_err(intent.get("month") or "今月")
         if merr:
             return merr
@@ -517,6 +591,10 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
             return err
         if store is None:
             return [{"type": "text", "text": need_register_text()}]
+        if is_user_manager(store, user_id):
+            mgr_err = _require_manager(store)
+            if mgr_err:
+                return mgr_err
         ym, merr = _month_or_err(intent.get("month") or "今月")
         if merr:
             return merr
@@ -550,9 +628,16 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
         if merr:
             return merr
         year, month = ym
-        sc, store = _scenario_for_user(user_id)
-        ok, note, _ = lock_month_payroll(store, sc, year=year, month=month, locked_by=user_id)
-        return [{"type": "text", "text": note}]
+        assert store is not None
+        set_pending_payroll_lock(store["store_id"], user_id, year, month)
+        return [{
+            "type": "text",
+            "text": (
+                f"{PAYROLL_CONFIRMATION}\n\n"
+                f"対象: {year}年{month}月\n"
+                "内容を確認したら「同意する」または「確定する」と送ってください。"
+            ),
+        }]
 
     if kind == "payroll_payslip":
         store, err = _require_store()
@@ -560,6 +645,10 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
             return err
         if store is None:
             return [{"type": "text", "text": need_register_text()}]
+        if is_user_manager(store, user_id):
+            mgr_err = _require_manager(store)
+            if mgr_err:
+                return mgr_err
         ym, merr = _month_or_err(intent.get("month") or "今月")
         if merr:
             return merr
@@ -613,6 +702,10 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
         if err:
             return err
         sc, store = _scenario_for_user(user_id)
+        if store and is_user_manager(store, user_id):
+            mgr_err = _require_manager(store)
+            if mgr_err:
+                return mgr_err
         default_worker = None
         if store:
             member = get_member(store, user_id) or {}
@@ -691,6 +784,10 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
         # スタッフも自分の店の予定人件費概要は見られてよい（PoC）。詳細操作は店長。
         if store is None:
             return [{"type": "text", "text": need_register_text()}]
+        if is_user_manager(store, user_id):
+            mgr_err = _require_manager(store)
+            if mgr_err:
+                return mgr_err
         sc, store = _scenario_for_user(user_id)
         summary = labor_cost_summary(sc, store)
         body = format_labor_cost_text(summary, store_name=store.get("store_name"))

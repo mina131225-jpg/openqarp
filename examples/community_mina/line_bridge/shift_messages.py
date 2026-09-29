@@ -148,6 +148,16 @@ def parse_user_intent(text: str) -> dict[str, Any]:
     raw = (text or "").strip()
     normalized = raw.replace("　", " ")
 
+    # --- 販売版の注意事項・同意（店長機能のゲート） ---
+    if re.fullmatch(r"注意事項|利用上の注意|免責", normalized, re.I):
+        return {"intent": "show_terms", "raw": raw}
+    if re.fullmatch(r"上記を確認しました|確認しました", normalized):
+        return {"intent": "ack_terms", "raw": raw}
+    if re.fullmatch(r"同意する|同意しました", normalized):
+        return {"intent": "agree", "raw": raw}
+    if re.fullmatch(r"確定する|給与を確定する", normalized):
+        return {"intent": "payroll_lock_confirm", "raw": raw, "month": "今月"}
+
     # --- 店長登録 ---
     m_mgr = re.search(
         r"^(?:店長登録|マネージャー登録|店長に登録)"

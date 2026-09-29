@@ -53,6 +53,10 @@ def main() -> int:
     _assert(ok_b and store_b is not None, f"create B failed: {msg_b}")
     sid_a, sid_b = store_a["store_id"], store_b["store_id"]
     code_a, code_b = store_a["invite_code"], store_b["invite_code"]
+    # 販売版の店長同意（以降の管理操作をテスト可能にする）
+    for manager_id in ("U_mgr_A", "U_mgr_B"):
+        _assert("確認しました" in "\n".join(m.get("text") or "" for m in handle(manager_id, "上記を確認しました")), "terms acknowledgement")
+        _assert("同意を記録" in "\n".join(m.get("text") or "" for m in handle(manager_id, "同意する")), "terms consent")
     _assert(sid_a != sid_b, "store ids must differ")
     _assert(code_a != code_b, "invite codes must differ")
     print(f"[iso] A={sid_a}/{code_a} B={sid_b}/{code_b}")

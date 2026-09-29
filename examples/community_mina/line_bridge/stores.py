@@ -41,6 +41,7 @@ DEFAULT_WEEKEND_DAYS = ["土", "日"]
 DEFAULT_COMMUTE_ALLOWANCE = 0
 DEFAULT_OT_MULTIPLIER = 1.25
 MANAGER_OWNER_CODE_ENV = "LINE_STORE_OWNER_CODE"  # optional global owner code
+TERMS_VERSION = "sales-v1"
 
 
 def _now_iso() -> str:
@@ -165,6 +166,7 @@ def create_store(
             "payroll_months": {},
             "actual_hours_by_month": {},
             "night_hours_per_weekend_shift": 2.0,
+            "pending_payroll_locks": {},
             "created_at": _now_iso(),
             "updated_at": _now_iso(),
         }
@@ -335,6 +337,9 @@ def _backfill_worker_ids(store: dict[str, Any]) -> bool:
         changed = True
     if "night_hours_per_weekend_shift" not in store:
         store["night_hours_per_weekend_shift"] = 2.0
+        changed = True
+    if not isinstance(store.get("pending_payroll_locks"), dict):
+        store["pending_payroll_locks"] = {}
         changed = True
     return changed
 
@@ -722,6 +727,97 @@ def set_store_wage_premiums(
         _save_unlocked(db)
         return deepcopy(store)
 
+
+
+def manager_terms_status(store: dict[str, Any] | None, user_id: str) -> dict[str, Any]:
+    """店長の現店舗における注意事項確認・同意状態。"""
+    member = get_member(store, user_id) or {}
+    if not member.get("is_manager"):
+        return {"acknowledged": False, "consented": False}
+    consent_store_id = member.get("consent_store_id") or member.get("store_id")
+    same_store = consent_store_id == (store or {}).get("store_id")
+    version_ok = member.get("terms_version") == TERMS_VERSION
+    return {
+        "acknowledged": bool(member.get("terms_acknowledged_at")) and same_store and version_ok,
+        "consented": bool(member.get("consent_at")) and same_store and version_ok,
+        "consent_at": member.get("consent_at"),
+        "terms_version": member.get("terms_version"),
+        "store_id": consent_store_id,
+    }
+
+
+def acknowledge_manager_terms(user_id: str) -> tuple[bool, str]:
+    """現店舗の店長について注意事項を確認済みにする。"""
+    uid = (user_id or "").strip()
+    with _LOCK:
+        db = _load_unlocked()
+        sid = db["user_index"].get(uid)
+        store = db["stores"].get(sid) if sid else None
+        member = _find_member_unlocked(store, user_id=uid) if store else None
+        if not store or not member or not member.get("is_manager"):
+            return False, "店長登録後にご利用ください。"
+        member["terms_acknowledged_at"] = _now_iso()
+        member["terms_version"] = TERMS_VERSION
+        member["consent_store_id"] = store["store_id"]
+        member["store_id"] = store["store_id"]
+        store["updated_at"] = _now_iso()
+        _save_unlocked(db)
+    return True, "注意事項を確認しました。続けて「同意する」と送ってください。"
+
+
+def consent_manager_terms(user_id: str) -> tuple[bool, str]:
+    """注意事項確認済みの店長について同意を記録する。"""
+    uid = (user_id or "").strip()
+    with _LOCK:
+        db = _load_unlocked()
+        sid = db["user_index"].get(uid)
+        store = db["stores"].get(sid) if sid else None
+        member = _find_member_unlocked(store, user_id=uid) if store else None
+        if not store or not member or not member.get("is_manager"):
+            return False, "店長登録後にご利用ください。"
+        if not member.get("terms_acknowledged_at") or member.get("terms_version") != TERMS_VERSION:
+            return False, "先に「上記を確認しました」と送って、注意事項を確認してください。"
+        now = _now_iso()
+        member["consent_at"] = now
+        member["terms_version"] = TERMS_VERSION
+        member["consent_store_id"] = store["store_id"]
+        member["store_id"] = store["store_id"]
+        store["updated_at"] = now
+        _save_unlocked(db)
+    return True, f"同意を記録しました（規約バージョン: {TERMS_VERSION}）。店長機能をご利用いただけます。"
+
+
+def set_pending_payroll_lock(store_id: str, user_id: str, year: int, month: int) -> bool:
+    with _LOCK:
+        db = _load_unlocked()
+        store = db["stores"].get(store_id)
+        if not store:
+            return False
+        store.setdefault("pending_payroll_locks", {})[(user_id or "").strip()] = {
+            "year": int(year), "month": int(month), "created_at": _now_iso()
+        }
+        store["updated_at"] = _now_iso()
+        _save_unlocked(db)
+        return True
+
+
+def get_pending_payroll_lock(store: dict[str, Any] | None, user_id: str) -> dict[str, Any] | None:
+    if not store:
+        return None
+    pending = (store.get("pending_payroll_locks") or {}).get((user_id or "").strip())
+    return deepcopy(pending) if isinstance(pending, dict) else None
+
+
+def clear_pending_payroll_lock(store_id: str, user_id: str) -> bool:
+    with _LOCK:
+        db = _load_unlocked()
+        store = db["stores"].get(store_id)
+        if not store:
+            return False
+        store.setdefault("pending_payroll_locks", {}).pop((user_id or "").strip(), None)
+        store["updated_at"] = _now_iso()
+        _save_unlocked(db)
+        return True
 
 def register_manager(
     user_id: str,

@@ -43,7 +43,18 @@ Credit: Powered by OpenQARP
      「給与 今月」「給与確定」※振込なし
 ```
 
-**隔離:** A店店長は B店のスタッフ／賃金／給与を見られない。回帰: `python test_store_isolation.py`
+**隔離:** A店店長は B店のスタッフ／賃金／給与を見られない。回帰: `python3 test_store_isolation.py`
+
+## 販売版の注意事項・同意
+
+店長が初めて店長機能を使うと、次の 2 段階で同意を記録します。
+
+1. `注意事項`（または店長機能への初回アクセス）で注意事項・免責を表示
+2. `上記を確認しました` → `同意する` の順に送信
+
+同意は店長メンバーに `consent_at`、`terms_version`、`store_id`（内部互換用に `consent_store_id` も保存）として保存されます。規約文面を変更するときは `TERMS_VERSION` を更新してください。ドラフトは [利用規約.md](./利用規約.md) と [プライバシーポリシー.md](./プライバシーポリシー.md) です。
+
+`給与確定` は即時ロックせず、`⚠️ この金額はシステムによる計算結果です。勤務実績・各種手当・法定割増等を確認しましたか？` を表示します。確認後に `同意する` または `確定する` を送るとロックされます。
 
 
 ## 店長向けコマンド（LINE 日本語）
@@ -96,6 +107,7 @@ Credit: Powered by OpenQARP
 | `members[].available_days` | 勤務可能日（任意・None=全日） |
 | `members[].role` / `skills` | 役割・スキル |
 | `members[].is_manager` | 店長フラグ |
+| `members[].consent_at` / `terms_version` / `store_id` | 店長の販売版同意記録 |
 | `wage_premiums` | 土日・祝日・深夜の割増倍率 |
 | `labor_budget_monthly` | 月次人件費予算 |
 | `payroll_months` / `actual_hours_by_month` | ロック済み給与・実績時間 |
