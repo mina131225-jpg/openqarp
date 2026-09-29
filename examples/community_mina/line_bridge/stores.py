@@ -29,6 +29,17 @@ _CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 # シナリオ workers と対応する枠（登録順に割当）
 WORKER_SLOTS = ["A", "B", "C", "D"]
 
+# PoC 既定: 時給・1シフト時間（予定人件費シミュレーション用。給与計算ではない）
+DEFAULT_HOURLY_WAGE = 1100
+DEFAULT_HOURS_PER_SHIFT = 8.0
+DEFAULT_WAGE_PREMIUMS = {
+    "weekend": 1.25,  # 土日割増倍率
+    "holiday": 1.35,  # 祝日割増（PoC: holiday_days 指定時）
+    "night": 1.25,    # 深夜割増（日単位ソルバでは未使用・設定のみ保持）
+}
+DEFAULT_WEEKEND_DAYS = ["土", "日"]
+MANAGER_OWNER_CODE_ENV = "LINE_STORE_OWNER_CODE"  # optional global owner code
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
@@ -139,9 +150,15 @@ def create_store(
             "store_name": name,
             "invite_code": code,
             "line_user_ids": [],
-            "members": [],  # {user_id, registered_at, worker_alias?}
+            "members": [],  # display_name/hourly_wage/available_days/max_hours_week/role/skills/is_manager
             "preferences": prefs,
             "scenario_override": None,
+            "hours_per_shift": DEFAULT_HOURS_PER_SHIFT,
+            "wage_premiums": dict(DEFAULT_WAGE_PREMIUMS),
+            "weekend_days": list(DEFAULT_WEEKEND_DAYS),
+            "holiday_days": [],
+            "pending_plans": None,
+            "confirmed_plan": None,
             "created_at": _now_iso(),
             "updated_at": _now_iso(),
         }
@@ -222,7 +239,7 @@ def _assign_worker_id(store: dict[str, Any]) -> str | None:
 
 
 def _backfill_worker_ids(store: dict[str, Any]) -> bool:
-    """既存メンバーに worker_id が無い場合、登録順で A/B/C/D を埋める。"""
+    """既存メンバーに worker_id / 時給 / 店長フラグが無い場合を埋める。"""
     changed = False
     members = store.setdefault("members", [])
     used = {
@@ -232,18 +249,62 @@ def _backfill_worker_ids(store: dict[str, Any]) -> bool:
     }
     for m in members:
         wid = str(m.get("worker_id") or "").strip()
-        if wid:
-            continue
-        for slot in WORKER_SLOTS:
-            if slot not in used:
-                m["worker_id"] = slot
-                used.add(slot)
-                changed = True
-                break
+        if not wid:
+            for slot in WORKER_SLOTS:
+                if slot not in used:
+                    m["worker_id"] = slot
+                    used.add(slot)
+                    changed = True
+                    break
         # display_name が無く worker_alias があれば流用
         if not m.get("display_name") and m.get("worker_alias"):
             m["display_name"] = m.get("worker_alias")
             changed = True
+        if "hourly_wage" not in m or m.get("hourly_wage") is None:
+            m["hourly_wage"] = DEFAULT_HOURLY_WAGE
+            changed = True
+        if "max_hours_week" not in m:
+            m["max_hours_week"] = None
+            changed = True
+        if "is_manager" not in m:
+            m["is_manager"] = False
+            changed = True
+        if "available_days" not in m:
+            m["available_days"] = None
+            changed = True
+        if "role" not in m:
+            m["role"] = None
+            changed = True
+        if "skills" not in m:
+            m["skills"] = []
+            changed = True
+    # 誰も店長でなければ最初のメンバーを店長に
+    if members and not any(bool(m.get("is_manager")) for m in members):
+        members[0]["is_manager"] = True
+        changed = True
+    if store.get("hours_per_shift") is None:
+        store["hours_per_shift"] = DEFAULT_HOURS_PER_SHIFT
+        changed = True
+    if not isinstance(store.get("wage_premiums"), dict):
+        store["wage_premiums"] = dict(DEFAULT_WAGE_PREMIUMS)
+        changed = True
+    else:
+        for k, v in DEFAULT_WAGE_PREMIUMS.items():
+            if k not in store["wage_premiums"]:
+                store["wage_premiums"][k] = v
+                changed = True
+    if not isinstance(store.get("weekend_days"), list):
+        store["weekend_days"] = list(DEFAULT_WEEKEND_DAYS)
+        changed = True
+    if "holiday_days" not in store:
+        store["holiday_days"] = []
+        changed = True
+    if "pending_plans" not in store:
+        store["pending_plans"] = None
+        changed = True
+    if "confirmed_plan" not in store:
+        store["confirmed_plan"] = None
+        changed = True
     return changed
 
 
@@ -315,6 +376,8 @@ def register_user(
         if not already:
             slot = _assign_worker_id(store)
             store.setdefault("line_user_ids", []).append(uid)
+            # 最初の登録者を店長に（既存店長がいなければ）
+            has_manager = any(bool(m.get("is_manager")) for m in store.get("members") or [])
             store.setdefault("members", []).append(
                 {
                     "user_id": uid,
@@ -322,6 +385,12 @@ def register_user(
                     "worker_id": slot,
                     "display_name": dn,
                     "worker_alias": dn,  # 互換: alias = 表示名
+                    "hourly_wage": DEFAULT_HOURLY_WAGE,
+                    "max_hours_week": None,
+                    "available_days": None,  # None = 全日可
+                    "role": None,
+                    "skills": [],
+                    "is_manager": not has_manager,
                 }
             )
         else:
@@ -344,6 +413,8 @@ def register_user(
             msg = f"「{name}」に登録済みです。"
         else:
             msg = f"「{name}」に登録しました。（枠 {slot}）"
+        if member.get("is_manager"):
+            msg += "\n役割: 店長"
         if shown:
             msg += f"\n表示名: {shown}"
         elif not already:
@@ -430,7 +501,7 @@ def set_store_preferred_offs(
     )
 
 
-def member_rows_masked(store: dict[str, Any]) -> list[dict[str, str]]:
+def member_rows_masked(store: dict[str, Any]) -> list[dict[str, Any]]:
     rows = []
     for m in store.get("members") or []:
         dn = m.get("display_name") or m.get("worker_alias") or "—"
@@ -441,6 +512,9 @@ def member_rows_masked(store: dict[str, Any]) -> list[dict[str, str]]:
                 "worker_id": str(m.get("worker_id") or "—"),
                 "display_name": str(dn),
                 "worker_alias": str(m.get("worker_alias") or dn or "—"),
+                "hourly_wage": int(m.get("hourly_wage") or DEFAULT_HOURLY_WAGE),
+                "max_hours_week": m.get("max_hours_week"),
+                "is_manager": bool(m.get("is_manager")),
             }
         )
     # line_user_ids にあって members に無い分も
@@ -457,6 +531,217 @@ def member_rows_masked(store: dict[str, Any]) -> list[dict[str, str]]:
                 }
             )
     return rows
+
+
+def is_user_manager(store: dict[str, Any] | None, user_id: str) -> bool:
+    m = get_member(store, user_id)
+    return bool(m and m.get("is_manager"))
+
+
+def staff_profiles_for_store(store: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
+    """worker_id → {display_name, hourly_wage, max_hours_week, is_manager, user_id}。"""
+    if not store:
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for m in store.get("members") or []:
+        wid = str(m.get("worker_id") or "").strip()
+        if not wid:
+            continue
+        dn = _normalize_display_name(m.get("display_name") or m.get("worker_alias"))
+        out[wid] = {
+            "user_id": m.get("user_id"),
+            "display_name": dn or wid,
+            "hourly_wage": int(m.get("hourly_wage") or DEFAULT_HOURLY_WAGE),
+            "max_hours_week": m.get("max_hours_week"),
+            "available_days": m.get("available_days"),
+            "role": m.get("role"),
+            "skills": list(m.get("skills") or []),
+            "is_manager": bool(m.get("is_manager")),
+        }
+    return out
+
+
+def hours_per_shift_for_store(store: dict[str, Any] | None) -> float:
+    if not store:
+        return DEFAULT_HOURS_PER_SHIFT
+    try:
+        return float(store.get("hours_per_shift") or DEFAULT_HOURS_PER_SHIFT)
+    except (TypeError, ValueError):
+        return DEFAULT_HOURS_PER_SHIFT
+
+
+def _find_member_unlocked(store: dict[str, Any], *, user_id: str | None = None, worker_id: str | None = None, display_name: str | None = None) -> dict[str, Any] | None:
+    uid = (user_id or "").strip() or None
+    wid = (worker_id or "").strip() or None
+    dn = _normalize_display_name(display_name)
+    for m in store.get("members") or []:
+        if uid and m.get("user_id") == uid:
+            return m
+        if wid and str(m.get("worker_id") or "") == wid:
+            return m
+        if dn:
+            mdn = _normalize_display_name(m.get("display_name") or m.get("worker_alias"))
+            if mdn == dn:
+                return m
+    return None
+
+
+def set_member_profile(
+    user_id: str | None = None,
+    *,
+    store_id: str | None = None,
+    worker_id: str | None = None,
+    display_name: str | None = None,
+    hourly_wage: int | None = None,
+    max_hours_week: float | None = None,
+    clear_max_hours: bool = False,
+    available_days: list[str] | None = None,
+    clear_available_days: bool = False,
+    role: str | None = None,
+    skills: list[str] | None = None,
+) -> tuple[bool, str, dict[str, Any] | None]:
+    """時給・週上限・勤務可能日・役割を更新（予定人件費シミュレーション用）。
+
+    user_id 指定時はその本人。店長が他人を更新する場合は store_id + worker_id/display_name。
+    """
+    uid = (user_id or "").strip() or None
+    with _LOCK:
+        db = _load_unlocked()
+        sid = store_id
+        if not sid and uid:
+            sid = db["user_index"].get(uid)
+        if not sid or sid not in db["stores"]:
+            return False, "まだ店舗に登録されていません。先に「登録 店舗コード」してください。", None
+        store = db["stores"][sid]
+        _backfill_worker_ids(store)
+        found = _find_member_unlocked(
+            store, user_id=uid if not worker_id and not display_name else None,
+            worker_id=worker_id, display_name=display_name,
+        )
+        # 本人指定で worker/display 無し
+        if found is None and uid and not worker_id and not display_name:
+            found = _find_member_unlocked(store, user_id=uid)
+        if found is None:
+            return False, "対象スタッフが見つかりません。", None
+        if hourly_wage is not None:
+            if hourly_wage < 0 or hourly_wage > 100_000:
+                return False, "時給は 0〜100000 円の範囲で指定してください。", None
+            found["hourly_wage"] = int(hourly_wage)
+        if clear_max_hours:
+            found["max_hours_week"] = None
+        elif max_hours_week is not None:
+            if max_hours_week < 0 or max_hours_week > 168:
+                return False, "週上限時間は 0〜168 の範囲で指定してください。", None
+            found["max_hours_week"] = float(max_hours_week)
+        if clear_available_days:
+            found["available_days"] = None
+        elif available_days is not None:
+            found["available_days"] = list(available_days)
+        if role is not None:
+            found["role"] = (role.strip() or None)
+        if skills is not None:
+            found["skills"] = [s for s in skills if s]
+        store["updated_at"] = _now_iso()
+        _save_unlocked(db)
+        label = found.get("display_name") or found.get("worker_id") or "?"
+        wage = int(found.get("hourly_wage") or DEFAULT_HOURLY_WAGE)
+        cap = found.get("max_hours_week")
+        cap_s = f"{cap:g}時間" if cap is not None else "なし"
+        avail = found.get("available_days")
+        avail_s = "全日" if not avail else ",".join(avail)
+        role_s = found.get("role") or "—"
+        msg = (
+            f"{label} のプロフィールを更新しました。\n"
+            f"時給 {wage}円／週上限 {cap_s}／勤務可能 {avail_s}／役割 {role_s}"
+        )
+        return True, msg, deepcopy(store)
+
+
+def set_store_wage_premiums(
+    store_id: str,
+    premiums: dict[str, float],
+    *,
+    weekend_days: list[str] | None = None,
+    holiday_days: list[str] | None = None,
+) -> dict[str, Any] | None:
+    with _LOCK:
+        db = _load_unlocked()
+        store = db["stores"].get(store_id)
+        if not store:
+            return None
+        cur = dict(store.get("wage_premiums") or DEFAULT_WAGE_PREMIUMS)
+        for k, v in premiums.items():
+            if k in ("weekend", "holiday", "night") and isinstance(v, (int, float)):
+                cur[k] = float(v)
+        store["wage_premiums"] = cur
+        if weekend_days is not None:
+            store["weekend_days"] = list(weekend_days)
+        if holiday_days is not None:
+            store["holiday_days"] = list(holiday_days)
+        store["updated_at"] = _now_iso()
+        _save_unlocked(db)
+        return deepcopy(store)
+
+
+def register_manager(
+    user_id: str,
+    invite_code: str,
+    *,
+    display_name: str | None = None,
+) -> tuple[bool, str, dict[str, Any] | None]:
+    """店長登録。登録＋ is_manager=True。例: 「店長登録 DEMO01」。"""
+    uid = (user_id or "").strip()
+    code = (invite_code or "").strip().upper()
+    if not uid:
+        return False, "userId がありません。", None
+    if not code:
+        return False, "店舗コードを指定してください。例: 「店長登録 DEMO01」", None
+
+    # まず通常登録（既登録でも OK）
+    ok, note, store = register_user(uid, code, display_name=display_name)
+    if not ok or store is None:
+        return ok, note, store
+
+    with _LOCK:
+        db = _load_unlocked()
+        sid = db["user_index"].get(uid)
+        if not sid or sid not in db["stores"]:
+            return False, "店舗への紐付けに失敗しました。", None
+        store = db["stores"][sid]
+        _backfill_worker_ids(store)
+        for m in store.get("members") or []:
+            if m.get("user_id") == uid:
+                m["is_manager"] = True
+                break
+        store["updated_at"] = _now_iso()
+        _save_unlocked(db)
+        name = store["store_name"]
+        msg = f"「{name}」の店長として登録しました。\n{note}"
+        return True, msg, deepcopy(store)
+
+
+def set_pending_plans(store_id: str, pending: dict[str, Any] | None) -> dict[str, Any] | None:
+    with _LOCK:
+        db = _load_unlocked()
+        store = db["stores"].get(store_id)
+        if not store:
+            return None
+        store["pending_plans"] = deepcopy(pending) if pending else None
+        store["updated_at"] = _now_iso()
+        _save_unlocked(db)
+        return deepcopy(store)
+
+
+def set_confirmed_plan(store_id: str, plan: dict[str, Any] | None) -> dict[str, Any] | None:
+    with _LOCK:
+        db = _load_unlocked()
+        store = db["stores"].get(store_id)
+        if not store:
+            return None
+        store["confirmed_plan"] = deepcopy(plan) if plan else None
+        store["updated_at"] = _now_iso()
+        _save_unlocked(db)
+        return deepcopy(store)
 
 
 def ensure_demo_store(

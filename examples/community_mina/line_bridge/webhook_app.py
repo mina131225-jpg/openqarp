@@ -41,7 +41,19 @@ _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
-from notify import reply_messages  # noqa: E402
+from notify import broadcast_to_store, reply_messages  # noqa: E402
+from plans import (  # noqa: E402
+    POC_FOOTER,
+    bundle_for_storage,
+    build_plans_flex,
+    format_labor_cost_text,
+    format_own_shift_text,
+    format_plans_text,
+    generate_three_plans,
+    labor_cost_summary,
+    pick_plan,
+    replan_lower_cost,
+)
 from shift_messages import (  # noqa: E402
     apply_pref_to_scenario,
     build_shift_flex,
@@ -61,9 +73,16 @@ from stores import (  # noqa: E402
     ensure_demo_store,
     get_member,
     get_store_for_user,
+    is_user_manager,
+    register_manager,
     register_user,
+    set_confirmed_plan,
     set_member_display_name,
+    set_member_profile,
+    set_pending_plans,
     set_store_preferred_offs,
+    set_store_wage_premiums,
+    staff_profiles_for_store,
 )
 
 LOG = logging.getLogger("line_bridge.webhook")
@@ -99,8 +118,49 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
     intent = parse_user_intent(text)
     kind = intent.get("intent")
 
+    def _require_store() -> tuple[dict[str, Any] | None, list[dict[str, Any]] | None]:
+        store = get_store_for_user(user_id)
+        if store is None and os.environ.get("LINE_REQUIRE_REGISTER", "true").strip().lower() in {
+            "1", "true", "yes", "on",
+        }:
+            if os.environ.get("LINE_ALLOW_ORPHAN", "").strip().lower() not in {
+                "1", "true", "yes", "on",
+            }:
+                return None, [{"type": "text", "text": need_register_text()}]
+        return store, None
+
+    def _require_manager(store: dict[str, Any] | None) -> list[dict[str, Any]] | None:
+        if store is None:
+            return [{"type": "text", "text": need_register_text()}]
+        if not is_user_manager(store, user_id):
+            return [{
+                "type": "text",
+                "text": (
+                    "この操作は店長のみです。\n"
+                    "店長の方は「店長登録 店舗コード」と送るか、"
+                    "最初に登録したアカウントで操作してください。"
+                ),
+            }]
+        return None
+
+    def _resolve_who(store: dict[str, Any], who: str | None) -> dict[str, Any] | None:
+        """who が枠名/表示名/空(本人)。戻り値は set_member_profile 用 kwargs。"""
+        if not who:
+            return {"user_id": user_id}
+        labels = display_labels_for_store(store)
+        # worker_id 直接
+        profiles = staff_profiles_for_store(store)
+        if who in profiles:
+            return {"store_id": store["store_id"], "worker_id": who}
+        # 表示名
+        for wid, lab in labels.items():
+            if lab == who:
+                return {"store_id": store["store_id"], "worker_id": wid}
+        # 「太郎さん」のさんなしで再試行は呼び出し側で
+        return {"store_id": store["store_id"], "display_name": who}
+
+    # ---- register / manager ----
     if kind == "register":
-        # デモ店舗が無い環境でも「登録 DEMO01」が通るよう用意
         if (intent.get("invite_code") or "").upper() == "DEMO01":
             ensure_demo_store()
         ok, note, store = register_user(
@@ -114,19 +174,34 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
                 f"{note}\n"
                 f"店舗ID: {store['store_id']}\n"
                 f"これで「希望休 日曜」「シフト見せて」が使えます。\n"
+                f"店長は「シフト3案作って」も利用可。\n"
                 f"{POC_BRANDING_COPY}"
             )
         else:
             body = note
         return [{"type": "text", "text": body}]
 
-    if kind == "register_incomplete":
-        return [
-            {
-                "type": "text",
-                "text": intent.get("hint", "") + "\n\n" + help_text(),
-            }
-        ]
+    if kind == "register_manager":
+        if (intent.get("invite_code") or "").upper() == "DEMO01":
+            ensure_demo_store()
+        ok, note, store = register_manager(
+            user_id,
+            intent.get("invite_code") or "",
+            display_name=intent.get("display_name"),
+        )
+        body = note if not ok else (
+            f"{note}\n"
+            f"店長コマンド: 「シフト3案作って」「今週の人件費見せて」"
+            f"「人件費を下げて再計算」「確定」\n"
+            f"{POC_BRANDING_COPY}"
+        )
+        return [{"type": "text", "text": body}]
+
+    if kind in {"register_incomplete", "register_manager_incomplete"}:
+        return [{
+            "type": "text",
+            "text": intent.get("hint", "") + "\n\n" + help_text(),
+        }]
 
     if kind == "set_name":
         ok, note, store = set_member_display_name(
@@ -137,12 +212,10 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
         return [{"type": "text", "text": note}]
 
     if kind == "set_name_incomplete":
-        return [
-            {
-                "type": "text",
-                "text": intent.get("hint", "") + "\n\n" + help_text(),
-            }
-        ]
+        return [{
+            "type": "text",
+            "text": intent.get("hint", "") + "\n\n" + help_text(),
+        }]
 
     if kind == "help" or kind == "set_pref_incomplete":
         msg = help_text()
@@ -153,33 +226,104 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
             member = get_member(store, user_id) or {}
             slot = member.get("worker_id") or "—"
             dn = member.get("display_name") or "（未設定）"
+            role = "店長" if member.get("is_manager") else "スタッフ"
+            wage = member.get("hourly_wage") or "—"
             msg = (
                 f"所属: {store['store_name']}（{store['invite_code']}）\n"
-                f"あなたの枠: {slot} ／ 表示名: {dn}\n\n"
+                f"あなたの枠: {slot} ／ 表示名: {dn} ／ 役割: {role} ／ 時給: {wage}\n\n"
                 + msg
             )
         else:
             msg = need_register_text() + "\n\n" + msg
         return [{"type": "text", "text": msg}]
 
-    if kind == "set_pref":
-        store = get_store_for_user(user_id)
-        if store is None and os.environ.get("LINE_REQUIRE_REGISTER", "true").strip().lower() in {
-            "1", "true", "yes", "on",
-        }:
-            # デモでは未登録でも orphan シナリオで動かすオプション
-            if os.environ.get("LINE_ALLOW_ORPHAN", "").strip().lower() not in {
-                "1", "true", "yes", "on",
-            }:
-                return [{"type": "text", "text": need_register_text()}]
+    # ---- profile: wage / hour cap / role / premium ----
+    if kind == "set_wage":
+        store, err = _require_store()
+        if err:
+            return err
+        if store is None:
+            return [{"type": "text", "text": need_register_text()}]
+        who = intent.get("who")
+        # 他人の時給変更は店長のみ
+        if who and not is_user_manager(store, user_id):
+            member = get_member(store, user_id) or {}
+            labels = display_labels_for_store(store)
+            self_names = {member.get("worker_id"), member.get("display_name"), labels.get(member.get("worker_id") or "")}
+            if who not in self_names:
+                return [{"type": "text", "text": "他人の時給変更は店長のみです。"}]
+        kwargs = _resolve_who(store, who)
+        ok, note, _ = set_member_profile(**kwargs, hourly_wage=int(intent["hourly_wage"]))
+        return [{"type": "text", "text": note + (f"\n{POC_BRANDING_COPY}" if ok else "")}]
 
+    if kind == "set_hour_cap":
+        store, err = _require_store()
+        if err:
+            return err
+        if store is None:
+            return [{"type": "text", "text": need_register_text()}]
+        mgr_err = _require_manager(store)
+        # 本人が自分の上限を言う場合は許可
+        who = intent.get("who")
+        member = get_member(store, user_id) or {}
+        self_ok = who in {
+            member.get("worker_id"),
+            member.get("display_name"),
+            (display_labels_for_store(store) or {}).get(member.get("worker_id") or ""),
+        }
+        if mgr_err and not self_ok:
+            return mgr_err
+        kwargs = _resolve_who(store, who)
+        ok, note, _ = set_member_profile(
+            **kwargs, max_hours_week=float(intent["max_hours_week"])
+        )
+        return [{"type": "text", "text": note + (f"\n{POC_BRANDING_COPY}" if ok else "")}]
+
+    if kind == "set_role":
+        store, err = _require_store()
+        if err:
+            return err
+        if store is None:
+            return [{"type": "text", "text": need_register_text()}]
+        who = intent.get("who")
+        if who and not is_user_manager(store, user_id):
+            return [{"type": "text", "text": "他人の役割変更は店長のみです。"}]
+        kwargs = _resolve_who(store, who)
+        ok, note, _ = set_member_profile(**kwargs, role=intent.get("role"))
+        return [{"type": "text", "text": note}]
+
+    if kind == "set_premium":
+        store, err = _require_store()
+        if err:
+            return err
+        mgr_err = _require_manager(store)
+        if mgr_err:
+            return mgr_err
+        assert store is not None
+        updated = set_store_wage_premiums(
+            store["store_id"], {intent["kind"]: float(intent["rate"])}
+        )
+        prem = (updated or {}).get("wage_premiums") or {}
+        return [{
+            "type": "text",
+            "text": (
+                f"割増を更新しました。\n"
+                f"土日×{prem.get('weekend')}／祝日×{prem.get('holiday')}／深夜×{prem.get('night')}\n"
+                f"（予定人件費シミュレーション用。給与計算ではありません）\n"
+                f"{POC_BRANDING_COPY}"
+            ),
+        }]
+
+    # ---- set_pref (existing) ----
+    if kind == "set_pref":
+        store, err = _require_store()
+        if err:
+            return err
         sc, store = _scenario_for_user(user_id)
-        # 自分の枠を既定にする（「希望休 日曜」→ 登録順の A/B/C/D）
         default_worker = None
         if store:
             member = get_member(store, user_id) or {}
             default_worker = member.get("worker_id")
-            # 表示名で希望休指定された場合も worker_id に解決
             w_raw = intent.get("worker")
             if w_raw:
                 labels = display_labels_for_store(store)
@@ -194,7 +338,6 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
             default_worker=default_worker,
         )
         if store:
-            # ラベルを維持（apply は deepcopy するが _display_labels もコピーされる）
             set_store_preferred_offs(store["store_id"], sc2.get("preferred_offs") or {})
             note = f"[{store['store_name']}] {note}"
         else:
@@ -205,25 +348,199 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
             build_shift_flex(result, alt_text=note),
         ]
 
-    # show_shift（既定）
-    store = get_store_for_user(user_id)
-    if store is None and os.environ.get("LINE_REQUIRE_REGISTER", "true").strip().lower() in {
-        "1", "true", "yes", "on",
-    }:
-        if os.environ.get("LINE_ALLOW_ORPHAN", "").strip().lower() not in {
-            "1", "true", "yes", "on",
-        }:
+    # ---- manager: 3 plans / labor / confirm ----
+    if kind in {"make_three_plans", "replan_lower_cost", "replan_budget"}:
+        store, err = _require_store()
+        if err:
+            return err
+        mgr_err = _require_manager(store)
+        if mgr_err:
+            return mgr_err
+        assert store is not None
+        sc, store = _scenario_for_user(user_id)
+        budget = intent.get("budget_yen") if kind == "replan_budget" else None
+        if kind == "replan_lower_cost" or kind == "replan_budget":
+            bundle = replan_lower_cost(sc, store, budget_yen=budget)
+            header = "人件費を抑えた再計算結果です。"
+            if budget:
+                header = f"人件費 {budget:,}円以内を意識した再計算結果です。"
+        else:
+            bundle = generate_three_plans(sc, store)
+            header = "シフト3案を作りました（古典ソルバの重み違い）。"
+        set_pending_plans(store["store_id"], bundle_for_storage(bundle))
+        # refresh store name
+        store = get_store_for_user(user_id) or store
+        text_body = header + "\n\n" + format_plans_text(bundle, store_name=store.get("store_name"))
+        # LINE reply max 5 messages; text can be long — trim if needed
+        if len(text_body) > 4500:
+            text_body = text_body[:4400] + "\n…(省略)"
+        return [
+            {"type": "text", "text": text_body},
+            build_plans_flex(bundle, alt_text=header),
+        ]
+
+    if kind == "show_labor_cost":
+        store, err = _require_store()
+        if err:
+            return err
+        # スタッフも自分の店の予定人件費概要は見られてよい（PoC）。詳細操作は店長。
+        if store is None:
             return [{"type": "text", "text": need_register_text()}]
+        sc, store = _scenario_for_user(user_id)
+        summary = labor_cost_summary(sc, store)
+        body = format_labor_cost_text(summary, store_name=store.get("store_name"))
+        return [{"type": "text", "text": body}]
+
+    if kind == "confirm_plan":
+        store, err = _require_store()
+        if err:
+            return err
+        mgr_err = _require_manager(store)
+        if mgr_err:
+            return mgr_err
+        assert store is not None
+        pending = store.get("pending_plans")
+        if not pending or not pending.get("plans"):
+            return [{
+                "type": "text",
+                "text": (
+                    "確定できる案がありません。先に「シフト3案作って」を送ってください。"
+                ),
+            }]
+        chosen = pick_plan(pending, intent.get("selector"))
+        if not chosen:
+            return [{"type": "text", "text": "案の指定が分かりません。例: 「確定 2」「確定 希望」"}]
+        # 保存
+        confirmed = {
+            "key": chosen["key"],
+            "label": chosen["label"],
+            "schedule": chosen["schedule"],
+            "metrics": chosen.get("metrics"),
+            "method": chosen.get("method"),
+            "confirmed_at": __import__("datetime").datetime.now(
+                __import__("datetime").timezone.utc
+            ).astimezone().isoformat(timespec="seconds"),
+            "confirmed_by": user_id,
+        }
+        set_confirmed_plan(store["store_id"], confirmed)
+        store = get_store_for_user(user_id) or store
+        m = chosen.get("metrics") or {}
+        notice = (
+            f"「{store['store_name']}」のシフトを【{chosen['label']}】で確定しました。\n"
+            f"希望休 {m.get('pref_ok')}/{m.get('pref_all')} ／ "
+            f"予定人件費 {int(m.get('projected_labor_cost') or 0):,}円 ／ "
+            f"公平性 {m.get('fairness')}\n"
+            f"{POC_FOOTER}"
+        )
+        # スタッフ通知
+        sc, _ = _scenario_for_user(user_id)
+        # build a result-like for flex from confirmed schedule
+        from plans import compute_metrics
+        metrics = compute_metrics(chosen["schedule"], sc, store=store)
+        result = {
+            "scenario": sc,
+            "classical": {
+                "schedule": chosen["schedule"],
+                "score": metrics.get("solver_score") or 0,
+                "seconds": metrics.get("seconds") or 0,
+                "pref_hits": [
+                    {"worker": h["worker"], "day": h["day"], "granted": h["granted"]}
+                    for h in (metrics.get("pref_hits") or [])
+                ],
+                "focus_on": [],
+                "focus_off": [],
+            },
+        }
+        # focus day fill
+        focus = sc.get("qaoa_focus_day", "日")
+        if focus in sc["days"]:
+            fi = sc["days"].index(focus)
+            result["classical"]["focus_on"] = sorted(
+                w for w in sc["workers"] if chosen["schedule"][w][fi]
+            )
+            result["classical"]["focus_off"] = sorted(
+                w for w in sc["workers"] if not chosen["schedule"][w][fi]
+            )
+        staff_msgs = [
+            {"type": "text", "text": f"【シフト確定のお知らせ】\n{notice}"},
+            build_shift_flex(result, alt_text="シフトが確定しました"),
+        ]
+        bc = broadcast_to_store(store, messages=staff_msgs)
+        reply = (
+            f"{notice}\n\n"
+            f"通知: {bc.get('detail')}\n"
+            f"（対象 {len(bc.get('targets') or [])} 名）"
+        )
+        return [{"type": "text", "text": reply}]
+
+    if kind == "show_own_shift":
+        store, err = _require_store()
+        if err:
+            return err
+        sc, store = _scenario_for_user(user_id)
+        member = get_member(store, user_id) if store else None
+        wid = (member or {}).get("worker_id")
+        if not wid:
+            return [{"type": "text", "text": "あなたの枠がまだありません。先に「登録」してください。"}]
+        # 確定があればそれ、なければライブ古典
+        schedule = None
+        if store and isinstance(store.get("confirmed_plan"), dict):
+            schedule = store["confirmed_plan"].get("schedule")
+        if schedule is None:
+            result = run_shift_for_line(sc)
+            schedule = result["classical"]["schedule"]
+            note_src = "（未確定の試算）"
+        else:
+            note_src = "（確定シフト）"
+        dn = (member or {}).get("display_name") or wid
+        body = format_own_shift_text(schedule, sc, wid, display_name=dn) + f"\n{note_src}"
+        return [{"type": "text", "text": body}]
+
+    # show_shift（既定）
+    store, err = _require_store()
+    if err:
+        return err
 
     sc, store = _scenario_for_user(user_id)
-    result = run_shift_for_line(sc)
-    header = f"今週のシフト案です。\n{POC_BRANDING_COPY}"
-    if store:
-        header = f"「{store['store_name']}」の今週のシフト案です。\n{POC_BRANDING_COPY}"
+    # 確定シフトがあればそれを表示
+    if store and isinstance(store.get("confirmed_plan"), dict) and store["confirmed_plan"].get("schedule"):
+        conf = store["confirmed_plan"]
+        from plans import compute_metrics
+        metrics = compute_metrics(conf["schedule"], sc, store=store)
+        result = {
+            "scenario": sc,
+            "classical": {
+                "schedule": conf["schedule"],
+                "score": metrics.get("solver_score") or 0,
+                "seconds": 0,
+                "pref_hits": metrics.get("pref_hits") or [],
+                "focus_on": [],
+                "focus_off": [],
+            },
+        }
+        focus = sc.get("qaoa_focus_day", "日")
+        if focus in sc["days"]:
+            fi = sc["days"].index(focus)
+            result["classical"]["focus_on"] = sorted(
+                w for w in sc["workers"] if conf["schedule"][w][fi]
+            )
+            result["classical"]["focus_off"] = sorted(
+                w for w in sc["workers"] if not conf["schedule"][w][fi]
+            )
+        header = (
+            f"「{store['store_name']}」の確定シフト（{conf.get('label')}）です。\n"
+            f"{POC_BRANDING_COPY}"
+        )
+    else:
+        result = run_shift_for_line(sc)
+        header = f"今週のシフト案です。\n{POC_BRANDING_COPY}"
+        if store:
+            header = f"「{store['store_name']}」の今週のシフト案です。\n{POC_BRANDING_COPY}"
     return [
         {"type": "text", "text": header},
         build_shift_flex(result),
     ]
+
 
 
 def process_event(event: dict[str, Any]) -> dict[str, Any] | None:
@@ -244,8 +561,8 @@ def process_event(event: dict[str, Any]) -> dict[str, Any] | None:
                 {
                     "type": "text",
                     "text": (
-                        "テキストで「登録 店舗コード」「名前 太郎」"
-                        "「シフト見せて」または「希望休 日曜」と送ってください。"
+                        "テキストで「登録 店舗コード」「シフト3案作って」"
+                        "「シフト見せて」「希望休 日曜」などと送ってください。"
                     ),
                 }
             ]

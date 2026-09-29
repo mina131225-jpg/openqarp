@@ -1,6 +1,51 @@
 {
   "version": 1,
-  "stores": {},
-  "invite_index": {},
+  "stores": {
+    "store_example": {
+      "store_id": "store_example",
+      "store_name": "サンプル店",
+      "invite_code": "DEMO01",
+      "line_user_ids": [],
+      "members": [
+        {
+          "user_id": "Uxxxxxxxx",
+          "registered_at": "2026-09-29T00:00:00+09:00",
+          "worker_id": "A",
+          "display_name": "太郎",
+          "worker_alias": "太郎",
+          "hourly_wage": 1200,
+          "max_hours_week": 40,
+          "available_days": null,
+          "role": "店長",
+          "skills": ["ホール"],
+          "is_manager": true
+        }
+      ],
+      "preferences": {
+        "preferred_offs": {
+          "A": ["日"],
+          "B": ["土"],
+          "C": ["水"],
+          "D": ["月", "日"]
+        }
+      },
+      "scenario_override": null,
+      "hours_per_shift": 8.0,
+      "wage_premiums": {
+        "weekend": 1.25,
+        "holiday": 1.35,
+        "night": 1.25
+      },
+      "weekend_days": ["土", "日"],
+      "holiday_days": [],
+      "pending_plans": null,
+      "confirmed_plan": null,
+      "created_at": "2026-09-29T00:00:00+09:00",
+      "updated_at": "2026-09-29T00:00:00+09:00"
+    }
+  },
+  "invite_index": {
+    "DEMO01": "store_example"
+  },
   "user_index": {}
 }

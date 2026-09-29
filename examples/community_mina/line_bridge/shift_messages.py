@@ -136,18 +136,173 @@ def load_base_scenario(path: str | Path | None = None) -> dict[str, Any]:
 def parse_user_intent(text: str) -> dict[str, Any]:
     """LINE テキストから意図を抽出。
 
-    例:
-      「登録 MINA01」「登録 DEMO01 太郎」「登録 DEMO01 名前 太郎」→ register
-      「名前 太郎」「名前変更 花子」→ set_name
-      「シフト見せて」「シフト表」→ show_shift
-      「希望休 日曜」「希望休 A 土」→ set_pref
-      その他 → help
+    スタッフ:
+      登録 / 名前 / 希望休 / シフト見せて / 自分のシフト
+    店長:
+      店長登録 CODE / シフト3案作って / 今週の人件費見せて
+      人件費を下げて再計算 / 人件費 N円以内で組み直して
+      確定 [案] / Aさんは週20時間以内 / 時給 1200 / 割増 ...
     """
     raw = (text or "").strip()
     normalized = raw.replace("　", " ")
-    lower_hint = normalized
 
-    # 表示名変更（登録済みユーザー向け）
+    # --- 店長登録 ---
+    m_mgr = re.search(
+        r"^(?:店長登録|マネージャー登録|店長に登録)"
+        r"\s*(?:[:：]\s*)?"
+        r"(?P<code>[A-Za-z0-9]{3,16})"
+        r"(?:\s+(?:名前\s+)?(?P<name>.+?))?"
+        r"\s*$",
+        normalized,
+        re.I,
+    )
+    if m_mgr:
+        return {
+            "intent": "register_manager",
+            "raw": raw,
+            "invite_code": m_mgr.group("code").upper(),
+            "display_name": (m_mgr.group("name") or "").strip() or None,
+        }
+    if re.search(r"^(?:店長登録|マネージャー登録)\s*$", normalized):
+        return {
+            "intent": "register_manager_incomplete",
+            "raw": raw,
+            "hint": "例: 「店長登録 DEMO01」",
+        }
+
+    # --- シフト3案 ---
+    if re.search(r"シフト\s*3案|3案作|三案作|シフト案.*作", normalized):
+        return {"intent": "make_three_plans", "raw": raw}
+
+    # --- 人件費を下げて再計算 / 人件費 N円以内 ---
+    m_budget = re.search(
+        r"人件費\s*(?P<yen>[0-9][0-9,]*)\s*円\s*(?:以内|以下)?\s*(?:で)?(?:組み直|再組|再計算|作)",
+        normalized,
+    )
+    if m_budget:
+        yen = int(m_budget.group("yen").replace(",", ""))
+        return {"intent": "replan_budget", "raw": raw, "budget_yen": yen}
+    if re.search(r"人件費\s*を?\s*(?:下げ|下げて|削減|安く).*再|再計算.*人件費|人件費優先で", normalized):
+        return {"intent": "replan_lower_cost", "raw": raw}
+
+    # --- 今週の人件費 ---
+    if re.search(r"人件費\s*(?:見せて|見せ|確認|いくら|教えて)|今週の人件費|予定人件費", normalized):
+        return {"intent": "show_labor_cost", "raw": raw}
+
+    # --- 確定 ---
+    m_conf = re.search(
+        r"^確定\s*(?P<sel>[A-Za-z0-9ぁ-んァ-ン一-龥]*)?\s*$",
+        normalized,
+    )
+    if m_conf:
+        return {
+            "intent": "confirm_plan",
+            "raw": raw,
+            "selector": (m_conf.group("sel") or "").strip() or None,
+        }
+
+    # --- 週上限: 「Aさんは週20時間以内」「太郎 週20時間」 ---
+    m_cap = re.search(
+        r"(?P<who>[A-Za-z0-9ぁ-んァ-ン一-龥]+?)\s*(?:さん|くん|ちゃん)?\s*"
+        r"(?:は|を|の)?\s*週\s*(?P<hours>[0-9]+(?:\.[0-9]+)?)\s*時間"
+        r"(?:以内|以下|まで)?",
+        normalized,
+    )
+    if m_cap and not re.search(r"希望休", normalized):
+        return {
+            "intent": "set_hour_cap",
+            "raw": raw,
+            "who": m_cap.group("who"),
+            "max_hours_week": float(m_cap.group("hours")),
+        }
+
+    # --- 時給 ---
+    # 「時給 1200」「時給 太郎 1500」「時給を1200円」「太郎の時給 1500」
+    m_wage = re.search(
+        r"^(?:時給)\s*(?:を|は)?\s*"
+        r"(?P<wage>[0-9][0-9,]*)\s*円?\s*$",
+        normalized,
+    )
+    if m_wage:
+        return {
+            "intent": "set_wage",
+            "raw": raw,
+            "who": None,
+            "hourly_wage": int(m_wage.group("wage").replace(",", "")),
+        }
+    m_wage2 = re.search(
+        r"^(?:時給)\s+"
+        r"(?P<who>[A-Za-zぁ-んァ-ン一-龥][A-Za-z0-9ぁ-んァ-ン一-龥]*)\s*"
+        r"(?:さん|くん|ちゃん)?\s*(?:を|は|の)?\s*"
+        r"(?P<wage>[0-9][0-9,]*)\s*円?\s*$",
+        normalized,
+    )
+    if m_wage2:
+        return {
+            "intent": "set_wage",
+            "raw": raw,
+            "who": m_wage2.group("who"),
+            "hourly_wage": int(m_wage2.group("wage").replace(",", "")),
+        }
+    m_wage3 = re.search(
+        r"^(?P<who>[A-Za-zぁ-んァ-ン一-龥][A-Za-z0-9ぁ-んァ-ン一-龥]*?)\s*"
+        r"(?:さん|くん|ちゃん)?\s*の\s*時給\s*(?:を|は)?\s*"
+        r"(?P<wage>[0-9][0-9,]*)\s*円?\s*$",
+        normalized,
+    )
+    if m_wage3:
+        return {
+            "intent": "set_wage",
+            "raw": raw,
+            "who": m_wage3.group("who"),
+            "hourly_wage": int(m_wage3.group("wage").replace(",", "")),
+        }
+
+    # --- 割増設定（店舗） ---
+    m_prem = re.search(
+        r"(?:割増|割増賃金)\s*(?P<kind>土日|週末|休日|祝日|深夜)\s*"
+        r"(?P<rate>[0-9]+(?:\.[0-9]+)?)\s*倍?",
+        normalized,
+    )
+    if m_prem:
+        kind_map = {"土日": "weekend", "週末": "weekend", "休日": "weekend", "祝日": "holiday", "深夜": "night"}
+        return {
+            "intent": "set_premium",
+            "raw": raw,
+            "kind": kind_map.get(m_prem.group("kind"), "weekend"),
+            "rate": float(m_prem.group("rate")),
+        }
+
+    # --- 役割 ---
+    # 「役割 ホール」「役割 太郎 キッチン」「太郎の役割 キッチン」
+    m_role = re.search(
+        r"^(?:役割|スキル)\s*(?:を|は)?\s*(?P<role>[ぁ-んァ-ン一-龥ーA-Za-z0-9]+)\s*$",
+        normalized,
+    )
+    if m_role:
+        role = m_role.group("role").strip()
+        if role and role not in {"変更", "設定"}:
+            return {"intent": "set_role", "raw": raw, "who": None, "role": role}
+    m_role2 = re.search(
+        r"^(?:役割|スキル)\s+"
+        r"(?P<who>[A-Za-zぁ-んァ-ン一-龥][A-Za-z0-9ぁ-んァ-ン一-龥]*)\s*"
+        r"(?:さん|くん|ちゃん)?\s+"
+        r"(?P<role>[ぁ-んァ-ン一-龥ーA-Za-z0-9]+)\s*$",
+        normalized,
+    )
+    if m_role2:
+        return {
+            "intent": "set_role",
+            "raw": raw,
+            "who": m_role2.group("who"),
+            "role": m_role2.group("role").strip(),
+        }
+
+    # --- 自分のシフト ---
+    if re.search(r"自分のシフト|マイシフト|私のシフト", normalized):
+        return {"intent": "show_own_shift", "raw": raw}
+
+    # --- 表示名変更 ---
     m_name = re.search(
         r"^(?:名前(?:変更)?|表示名(?:変更)?|ニックネーム)"
         r"\s*(?:[:：]\s*)?"
@@ -156,7 +311,6 @@ def parse_user_intent(text: str) -> dict[str, Any]:
     )
     if m_name and not re.search(r"^登録", normalized):
         name = (m_name.group("name") or "").strip()
-        # 「名前」だけ／「名前変更」だけ
         if not name or name in {"変更", "を変更", "を設定"}:
             return {
                 "intent": "set_name_incomplete",
@@ -169,7 +323,7 @@ def parse_user_intent(text: str) -> dict[str, Any]:
             "display_name": name,
         }
 
-    # 登録 <店舗コード> [名前 <表示名> | <表示名>]
+    # --- 登録 ---
     m_reg = re.search(
         r"^(?:登録|バインド|紐付[けけ]?)"
         r"(?:\s*店舗(?:コード|ID)?)?"
@@ -186,8 +340,7 @@ def parse_user_intent(text: str) -> dict[str, Any]:
     )
     if m_reg:
         dn = (m_reg.group("name_kw") or m_reg.group("name_plain") or "").strip() or None
-        # 誤って「登録 CODE シフト」等を名前にしないよう、予約語は無視
-        if dn and re.search(r"^(シフト|希望休|ヘルプ|使い方|help)$", dn, re.I):
+        if dn and re.search(r"^(シフト|希望休|ヘルプ|使い方|help|確定|人件費)$", dn, re.I):
             dn = None
         return {
             "intent": "register",
@@ -207,12 +360,13 @@ def parse_user_intent(text: str) -> dict[str, Any]:
             ),
         }
 
-    if re.search(r"シフト|組表|スケジュール", lower_hint) and not re.search(
-        r"希望休", lower_hint
+    # --- シフト見せて（3案・自分のシフトより後） ---
+    if re.search(r"シフト|組表|スケジュール", normalized) and not re.search(
+        r"希望休|3案|三案", normalized
     ):
         return {"intent": "show_shift", "raw": raw}
 
-    # 希望休 <任意ワーカー> <曜日>
+    # --- 希望休 ---
     m = re.search(
         r"希望休\s*(?:[:：]\s*)?"
         r"(?:(?P<worker>[A-Za-z0-9ぁ-んァ-ン一-龥]+)\s+)?"
@@ -242,6 +396,7 @@ def parse_user_intent(text: str) -> dict[str, Any]:
         return {"intent": "help", "raw": raw}
 
     return {"intent": "help", "raw": raw}
+
 
 
 def apply_pref_to_scenario(
@@ -480,18 +635,27 @@ def build_shift_flex(result: dict[str, Any], *, alt_text: str | None = None) -> 
 def help_text() -> str:
     return (
         "【使い方】\n"
-        "・「登録 DEMO01」→ 店長の店舗コードでスタッフ登録\n"
-        "・「登録 DEMO01 太郎」→ 登録と同時に表示名を設定\n"
-        "・「名前 太郎」／「名前変更 花子」→ 表示名の設定・変更\n"
-        "・「シフト見せて」→ 所属店舗の今週のシフト案を返信\n"
-        "・「希望休 日曜」→ 自分の枠に希望休を反映して再組表\n"
-        "・「希望休 A 土」→ スタッフ枠を指定して希望休登録\n"
-        "・「ヘルプ」→ この案内\n"
+        "■ スタッフ\n"
+        "・「登録 DEMO01」／「登録 DEMO01 太郎」→ 店舗登録\n"
+        "・「名前 太郎」→ 表示名\n"
+        "・「時給 1200」→ 自分の時給（予定人件費用）\n"
+        "・「希望休 日曜」→ 希望休を反映して再組表\n"
+        "・「シフト見せて」→ 店舗の今週案\n"
+        "・「自分のシフト」→ 自分の枠だけ表示\n"
+        "\n"
+        "■ 店長\n"
+        "・「店長登録 DEMO01」→ 店長フラグ付与（最初の登録者も店長）\n"
+        "・「シフト3案作って」→ 希望優先／人件費優先／バランス\n"
+        "・「今週の人件費見せて」→ 予定人件費シミュレーション\n"
+        "・「人件費を下げて再計算」／「人件費 120000円以内で組み直して」\n"
+        "・「太郎さんは週20時間以内」→ 週上限\n"
+        "・「割増 土日 1.25」→ 土日割増倍率\n"
+        "・「確定」「確定 希望」「確定 2」→ 案を保存しスタッフへ通知\n"
         "\n"
         f"{POC_BRANDING_COPY}\n"
-        "※ 販売時はお客様の LINE 公式アカウントを使います。"
-        "開発者個人 LINE は不要です。\n"
-        "※ デモ／未設定時は実 LINE には送らず、ログと定型返信のみです。\n"
+        "※ 予定人件費はシミュレーションです（給与計算・支払いではありません）。\n"
+        "※ 組表本体は古典ソルバ。QUBO/QAOA は注目日比較フック時のみ明示します。\n"
+        "※ 販売時はお客様の LINE 公式アカウントを使います。開発者個人 LINE は不要です。\n"
         "Credit: Powered by OpenQARP"
     )
 
@@ -502,8 +666,8 @@ def canned_follow_reply() -> str:
         f"{POC_BRANDING_COPY}\n"
         "まず店長から受け取った店舗コードで\n"
         "「登録 ○○○○」または「登録 ○○○○ 太郎」と送ってください。\n"
-        "表示名は後から「名前 太郎」でも設定できます。\n"
-        "その後「シフト見せて」「希望休 日曜」が使えます。\n"
+        "店長の方は「店長登録 ○○○○」でも登録できます。\n"
+        "その後「シフト見せて」「希望休 日曜」「シフト3案作って」が使えます。\n"
         "（資格情報未設定時はデモ返信のみ／開発者個人 LINE は不要）"
     )
 
@@ -544,4 +708,6 @@ def scenario_for_store(store: dict[str, Any] | None) -> dict[str, Any]:
         labels[wid] = dn if dn else wid
     if labels:
         sc["_display_labels"] = labels
+    # 予定人件費・制約用メタ（ソルバ本体は無視、plans が参照）
+    sc["_store_id"] = store.get("store_id")
     return sc
