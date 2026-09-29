@@ -728,8 +728,19 @@ def register_manager(
     invite_code: str,
     *,
     display_name: str | None = None,
+    owner_code: str | None = None,
 ) -> tuple[bool, str, dict[str, Any] | None]:
-    """店長登録。登録＋ is_manager=True。例: 「店長登録 DEMO01」。"""
+    """店長登録。例: 「店長登録 DEMO01」。
+
+    隔離ルール（PoC）:
+      - 招待コードの店舗にのみ作用（他店データは触れない）
+      - 既に別店舗の店長なら、他店への店長エスカレーションを拒否
+      - 店長フラグ付与は次のいずれかのみ:
+          (1) その店舗に店長がまだいない（初回店長）
+          (2) 既にその店舗のメンバー（同一店舗内での昇格）
+          (3) LINE_STORE_OWNER_CODE（または引数 owner_code）が一致
+      - 条件外ならスタッフ登録のみ（店長にはならない）
+    """
     uid = (user_id or "").strip()
     code = (invite_code or "").strip().upper()
     if not uid:
@@ -737,16 +748,64 @@ def register_manager(
     if not code:
         return False, "店舗コードを指定してください。例: 「店長登録 DEMO01」", None
 
-    # まず通常登録（既登録でも OK）
+    target = get_store_by_invite(code)
+    if target is None and code == "DEMO01":
+        ensure_demo_store()
+        target = get_store_by_invite(code)
+    if target is None:
+        return False, f"店舗コード「{code}」が見つかりません。店長に確認してください。", None
+    target_sid = target["store_id"]
+
+    # 別店舗の現役店長による横断エスカレーションを拒否
+    current = get_store_for_user(uid)
+    if current and current["store_id"] != target_sid and is_user_manager(current, uid):
+        return (
+            False,
+            (
+                f"すでに「{current['store_name']}」の店長です。"
+                f"他店舗の店長登録はできません（店舗隔離）。"
+                f"移籍する場合はスタッフとして「登録 {code}」を使ってください。"
+            ),
+            None,
+        )
+
+    already_member = any(
+        m.get("user_id") == uid for m in (target.get("members") or [])
+    )
+    has_manager = any(bool(m.get("is_manager")) for m in (target.get("members") or []))
+    env_owner = (os.environ.get(MANAGER_OWNER_CODE_ENV) or "").strip()
+    provided = (owner_code or "").strip()
+    owner_ok = (
+        bool(env_owner)
+        and bool(provided)
+        and len(provided) == len(env_owner)
+        and secrets.compare_digest(provided, env_owner)
+    )
+
+    allow_manager = (not has_manager) or already_member or owner_ok
+
     ok, note, store = register_user(uid, code, display_name=display_name)
     if not ok or store is None:
         return ok, note, store
+
+    if not allow_manager:
+        return (
+            True,
+            (
+                f"{note}\n"
+                f"この店舗には既に店長がいます。スタッフとして登録しました。"
+                f"（店長昇格は同一店舗メンバーまたはオーナーコードが必要です）"
+            ),
+            store,
+        )
 
     with _LOCK:
         db = _load_unlocked()
         sid = db["user_index"].get(uid)
         if not sid or sid not in db["stores"]:
             return False, "店舗への紐付けに失敗しました。", None
+        if sid != target_sid:
+            return False, "店舗隔離エラー: 予期しない店舗へ紐付きました。", None
         store = db["stores"][sid]
         _backfill_worker_ids(store)
         for m in store.get("members") or []:
@@ -758,6 +817,63 @@ def register_manager(
         name = store["store_name"]
         msg = f"「{name}」の店長として登録しました。\n{note}"
         return True, msg, deepcopy(store)
+
+
+def create_store_as_manager(
+    user_id: str,
+    store_name: str,
+    *,
+    display_name: str | None = None,
+    invite_code: str | None = None,
+) -> tuple[bool, str, dict[str, Any] | None]:
+    """新規店舗を作成し、呼び出しユーザーを店長として登録。
+
+    SaaS オンボード用。既存店舗の invite を使わず、自分の店舗だけを持つ。
+    既に別店舗に所属している場合は移籍（1 user = 1 store）。
+    """
+    uid = (user_id or "").strip()
+    name = (store_name or "").strip()
+    if not uid:
+        return False, "userId がありません。", None
+    if not name:
+        return False, "店舗名を指定してください。例: 「店舗作成 青山店」", None
+    if len(name) > 40:
+        return False, "店舗名は40文字以内にしてください。", None
+
+    rec = create_store(name, invite_code=invite_code)
+    ok, note, store = register_manager(
+        uid,
+        rec["invite_code"],
+        display_name=display_name,
+    )
+    if not ok or store is None:
+        return ok, note, store
+    msg = (
+        f"店舗「{store['store_name']}」を作成しました。\n"
+        f"店舗ID: {store['store_id']}\n"
+        f"招待コード: {store['invite_code']}\n"
+        f"スタッフ招待: 「登録 {store['invite_code']} 太郎」と送ってもらってください。\n"
+        f"{note}"
+    )
+    return True, msg, store
+
+
+def user_belongs_to_store(user_id: str, store_id: str) -> bool:
+    """user_index 上で user が store_id に属するか。"""
+    uid = (user_id or "").strip()
+    sid = (store_id or "").strip()
+    if not uid or not sid:
+        return False
+    with _LOCK:
+        db = _load_unlocked()
+        return db["user_index"].get(uid) == sid
+
+
+def require_same_store(user_id: str, store_id: str) -> tuple[bool, str]:
+    """クロス店舗操作ガード。失敗時メッセージ付き。"""
+    if user_belongs_to_store(user_id, store_id):
+        return True, ""
+    return False, "店舗隔離: 所属外の店舗データにはアクセスできません。"
 
 
 def set_pending_plans(store_id: str, pending: dict[str, Any] | None) -> dict[str, Any] | None:

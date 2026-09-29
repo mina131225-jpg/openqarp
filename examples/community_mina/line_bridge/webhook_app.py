@@ -69,6 +69,7 @@ from shift_messages import (  # noqa: E402
     scenario_for_store,
 )
 from stores import (  # noqa: E402
+    create_store_as_manager,
     display_labels_for_store,
     ensure_demo_store,
     get_member,
@@ -213,11 +214,27 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
         )
         return [{"type": "text", "text": body}]
 
-    if kind in {"register_incomplete", "register_manager_incomplete"}:
+    if kind in {"register_incomplete", "register_manager_incomplete", "create_store_incomplete"}:
         return [{
             "type": "text",
             "text": intent.get("hint", "") + "\n\n" + help_text(),
         }]
+
+    if kind == "create_store":
+        ok, note, store = create_store_as_manager(
+            user_id,
+            intent.get("store_name") or "",
+            display_name=intent.get("display_name"),
+        )
+        if ok and store:
+            body = (
+                f"{note}\n"
+                f"店長コマンド: 「シフト3案作って」「給与 今月」「人件費予算 200000」\n"
+                f"{POC_BRANDING_COPY}"
+            )
+        else:
+            body = note
+        return [{"type": "text", "text": body}]
 
     if kind == "set_name":
         ok, note, store = set_member_display_name(
@@ -477,9 +494,18 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
             return merr
         year, month = ym
         sc, store = _scenario_for_user(user_id)
+        # 店長のみ店舗全体の給与一覧。スタッフは自分のみ（他店・同僚の賃金は見せない）
+        if not is_user_manager(store, user_id):
+            member = get_member(store, user_id) or {}
+            wid = member.get("worker_id")
+            if not wid:
+                return [{"type": "text", "text": "あなたの枠がありません。"}]
+            row = build_staff_forecast(store, sc, wid, year=year, month=month)
+            if not row:
+                return [{"type": "text", "text": "給与見込みを作れませんでした。"}]
+            return [{"type": "text", "text": format_staff_payroll_text(row, store_name=store.get("store_name"))}]
         fc = month_forecast(store, sc, year=year, month=month)
         body = format_month_payroll_text(fc, store_name=store.get("store_name"))
-        # 予算ダッシュボードも添える
         body = format_budget_status_text(fc, store_name=store.get("store_name")) + "\n\n" + body
         if len(body) > 4500:
             body = body[:4400] + "\n…(省略)"
@@ -496,14 +522,16 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
             return merr
         year, month = ym
         who = intent.get("who")
+        member = get_member(store, user_id) or {}
         wid = find_worker_id(store, who)
         if not wid:
-            # 本人?
-            member = get_member(store, user_id) or {}
             if who in {member.get("display_name"), member.get("worker_id")}:
                 wid = member.get("worker_id")
         if not wid:
             return [{"type": "text", "text": f"{who} が見つかりません。表示名または枠名（A/B/C）で指定してください。"}]
+        # 店舗内でもスタッフは本人のみ。店長のみ他スタッフ参照可（他店舗は get_store_for_user で既に除外）
+        if not is_user_manager(store, user_id) and wid != member.get("worker_id"):
+            return [{"type": "text", "text": "他スタッフの給与は店長のみ閲覧できます。"}]
         sc, store = _scenario_for_user(user_id)
         row = build_staff_forecast(store, sc, wid, year=year, month=month)
         if not row:
@@ -537,9 +565,12 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
             return merr
         year, month = ym
         who = intent.get("who")
+        member = get_member(store, user_id) or {}
         wid = find_worker_id(store, who)
         if not wid:
             return [{"type": "text", "text": f"{who} が見つかりません。"}]
+        if not is_user_manager(store, user_id) and wid != member.get("worker_id"):
+            return [{"type": "text", "text": "他スタッフの明細は店長のみ閲覧できます。"}]
         locked = get_locked_payslip(store, wid, year=year, month=month)
         if locked:
             return [{"type": "text", "text": format_payslip_text(locked, store_name=store.get("store_name"))}]
@@ -593,6 +624,18 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
                 if w_raw in inv:
                     intent = dict(intent)
                     intent["worker"] = inv[w_raw]
+                # 他枠の希望休は店長のみ（店舗内でもクロス枠書込を防ぐ）
+                resolved = intent.get("worker") or w_raw
+                if (
+                    resolved
+                    and resolved != default_worker
+                    and resolved != member.get("display_name")
+                    and not is_user_manager(store, user_id)
+                ):
+                    return [{
+                        "type": "text",
+                        "text": "他スタッフの希望休変更は店長のみです。自分の希望は「希望休 日曜」と送ってください。",
+                    }]
         sc2, note = apply_pref_to_scenario(
             sc,
             worker=intent.get("worker"),
@@ -875,8 +918,22 @@ def health():
 
 @app.get("/stores")
 def stores_list():
-    """デモ用: 店舗概要（userId はマスク）。"""
+    """管理用: 全店舗一覧。トークン必須（未設定時は拒否）。
+
+    マルチテナント隔離のため、招待コード・賃金・メンバー詳細は
+    X-Admin-Token == LINE_STORES_ADMIN_TOKEN のときだけ返す。
+    """
     from stores import list_stores, mask_user_id, member_rows_masked
+
+    admin = (os.environ.get("LINE_STORES_ADMIN_TOKEN") or "").strip()
+    got = (request.headers.get("X-Admin-Token") or request.args.get("token") or "").strip()
+    if not admin:
+        return jsonify({
+            "ok": False,
+            "error": "stores listing disabled (set LINE_STORES_ADMIN_TOKEN to enable)",
+        }), 403
+    if not got or len(got) != len(admin) or not __import__("hmac").compare_digest(got, admin):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
 
     out = []
     for s in list_stores():

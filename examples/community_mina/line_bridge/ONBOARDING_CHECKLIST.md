@@ -93,6 +93,18 @@ set -a && source .env && set +a
 
 ---
 
+## Step 5a. LINE から店舗を作成する（推奨・SaaS PoC）
+
+- [ ] 店長が公式を友だち追加
+- [ ] `店舗作成 <店舗名>` を送信（例: `店舗作成 青山店`）
+- [ ] 返信の **招待コード** を控える
+- [ ] スタッフに友だち追加 URL／QR ＋ 招待コードを渡す
+- [ ] スタッフが `登録 <コード> <名前>` で参加
+
+詳細: [SAAS_ONBOARDING.md](./SAAS_ONBOARDING.md)
+
+隔離確認（任意）: `python test_store_isolation.py`
+
 ## Step 5. Streamlit で店舗を作成する（約 2〜3 分）
 
 - [ ] `streamlit run examples/community_mina/pitch/app.py` を起動
