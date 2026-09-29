@@ -825,11 +825,23 @@ def build_plans_flex(bundle: dict[str, Any], *, alt_text: str | None = None) -> 
                     "layout": "vertical",
                     "contents": [
                         {
+                            "type": "button",
+                            "style": "primary",
+                            "height": "md",
+                            "action": {
+                                "type": "postback",
+                                "label": "この案で確定",
+                                "data": f"v=1&action=confirm_plan&key={p['key']}",
+                                "displayText": f"確定 {p['label']}",
+                            },
+                        },
+                        {
                             "type": "text",
-                            "text": f"「確定 {i}」または「確定 {p['label']}」",
+                            "text": f"テキストでも可: 「確定 {i}」／「確定 {p['label']}」",
                             "size": "xxs",
                             "color": "#64748b",
                             "wrap": True,
+                            "margin": "sm",
                         },
                         {
                             "type": "text",
@@ -841,6 +853,7 @@ def build_plans_flex(bundle: dict[str, Any], *, alt_text: str | None = None) -> 
                         },
                     ],
                     "paddingAll": "10px",
+                    "spacing": "sm",
                 },
             }
         )

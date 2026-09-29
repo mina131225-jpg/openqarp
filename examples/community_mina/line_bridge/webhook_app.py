@@ -92,6 +92,24 @@ from stores import (  # noqa: E402
     staff_profiles_for_store,
 )
 from terms import CAUTION_TEXT, PAYROLL_CONFIRMATION, caution_prompt  # noqa: E402
+from line_ui import (  # noqa: E402
+    attach_quick_reply_to_last,
+    build_manager_menu_flex,
+    build_staff_menu_flex,
+    consent_ack_items,
+    consent_agree_items,
+    context_menu_for,
+    guest_menu_items,
+    manager_menu_items,
+    payroll_confirm_items,
+    payroll_menu_messages,
+    postback_to_intent,
+    pref_picker_messages,
+    staff_mgmt_messages,
+    staff_menu_items,
+    store_settings_messages,
+    with_quick_reply,
+)
 
 from payroll import (  # noqa: E402
     build_staff_forecast,
@@ -138,10 +156,164 @@ def _scenario_for_user(user_id: str) -> tuple[dict[str, Any], dict[str, Any] | N
     return _ORPHAN_SCENARIOS[user_id], None
 
 
+def _decorate_menu(user_id: str, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Attach role-appropriate quick reply menu to the last message."""
+    if not messages:
+        return messages
+    store = get_store_for_user(user_id)
+    registered = store is not None
+    is_mgr = bool(store and is_user_manager(store, user_id))
+    return attach_quick_reply_to_last(
+        messages, context_menu_for(is_manager=is_mgr, registered=registered)
+    )
+
+
+def _consent_messages(body: str, *, acknowledged: bool) -> list[dict[str, Any]]:
+    items = consent_agree_items() if acknowledged else consent_ack_items()
+    return [with_quick_reply({"type": "text", "text": body}, items)]
+
+
+def _menu_or_consent(user_id: str, store: dict[str, Any]) -> list[dict[str, Any]] | None:
+    """If manager terms not consented, return consent UI; else None."""
+    if not is_user_manager(store, user_id):
+        return None
+    terms = manager_terms_status(store, user_id)
+    if terms.get("consented"):
+        return None
+    return _consent_messages(
+        caution_prompt(acknowledged=bool(terms.get("acknowledged"))),
+        acknowledged=bool(terms.get("acknowledged")),
+    )
+
+
+def handle_postback_message(user_id: str, data: str) -> list[dict[str, Any]]:
+    """postback data → messages (reuses text intent dispatch)."""
+    intent = postback_to_intent(data)
+    if intent is None:
+        return _decorate_menu(
+            user_id,
+            [{"type": "text", "text": "不明なボタンです。「メニュー」または「使い方」を送ってください。"}],
+        )
+    # Prefer typed text synthesis only when needed; menus go through handle_text_message raw.
+    kind = intent.get("intent")
+    # set_pref_incomplete from prompt_pref → day picker
+    if kind == "set_pref_incomplete" and intent.get("via") == "postback":
+        return pref_picker_messages()
+    # For intents that map 1:1 to text commands, synthesize to reuse parser/handlers
+    synth = {
+        "make_three_plans": "シフト3案作って",
+        "replan_lower_cost": "人件費を下げて再計算",
+        "show_labor_cost": "今週の人件費見せて",
+        "show_shift": "シフト見せて",
+        "show_own_shift": "自分のシフト",
+        "ack_terms": "上記を確認しました",
+        "agree": "同意する",
+        "payroll_lock_confirm": "確定する",
+        "show_terms": "注意事項",
+        "help": "使い方",
+        "manager_menu": "メニュー",
+        "staff_menu": "スタッフメニュー",
+        "store_settings": "店舗設定",
+        "staff_mgmt": "スタッフ管理",
+        "payroll_menu": "人件費・給与",
+        "month_status": "今月の状況",
+    }
+    if kind == "confirm_plan":
+        sel = intent.get("selector") or ""
+        return handle_text_message(user_id, f"確定 {sel}".strip())
+    if kind == "set_pref":
+        day = intent.get("day") or ""
+        return handle_text_message(user_id, f"希望休 {day}")
+    if kind == "payroll_month":
+        return handle_text_message(user_id, f"給与 {intent.get('month') or '今月'}")
+    if kind == "payroll_lock":
+        return handle_text_message(user_id, f"給与確定 {intent.get('month') or '今月'}")
+    if kind == "payroll_csv":
+        return handle_text_message(user_id, f"給与CSV {intent.get('month') or '今月'}")
+    if kind in {"register_incomplete", "set_name_incomplete"}:
+        # fall into text handler with synthetic incomplete
+        return handle_text_message(user_id, "登録" if kind == "register_incomplete" else "名前")
+    if kind in synth:
+        return handle_text_message(user_id, synth[kind])
+    return handle_text_message(user_id, intent.get("raw") or "使い方")
+
+
 def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
     """テキスト意図 → LINE messages[]（店舗単位）。"""
     intent = parse_user_intent(text)
     kind = intent.get("intent")
+
+    # ---- button menus (text fallback labels) ----
+    if kind == "manager_menu":
+        store = get_store_for_user(user_id)
+        if store is None:
+            return attach_quick_reply_to_last(
+                [{"type": "text", "text": need_register_text()}], guest_menu_items()
+            )
+        if not is_user_manager(store, user_id):
+            flex = build_staff_menu_flex(store_name=store.get("store_name"))
+            return attach_quick_reply_to_last(
+                [{"type": "text", "text": "スタッフ向けメニューです。"}, flex],
+                staff_menu_items(),
+            )
+        blocked = _menu_or_consent(user_id, store)
+        if blocked:
+            return blocked
+        flex = build_manager_menu_flex(store_name=store.get("store_name"))
+        return attach_quick_reply_to_last(
+            [{"type": "text", "text": "店長メニューです。ボタンから選んでください。"}, flex],
+            manager_menu_items(),
+        )
+
+    if kind == "staff_menu":
+        store = get_store_for_user(user_id)
+        if store is None:
+            return attach_quick_reply_to_last(
+                [{"type": "text", "text": need_register_text()}], guest_menu_items()
+            )
+        flex = build_staff_menu_flex(store_name=store.get("store_name"))
+        return attach_quick_reply_to_last(
+            [{"type": "text", "text": "スタッフメニューです。"}, flex],
+            staff_menu_items(),
+        )
+
+    if kind == "store_settings":
+        store = get_store_for_user(user_id)
+        if store is None:
+            return _decorate_menu(user_id, [{"type": "text", "text": need_register_text()}])
+        if not is_user_manager(store, user_id):
+            return [{"type": "text", "text": "店舗設定は店長のみです。"}]
+        blocked = _menu_or_consent(user_id, store)
+        if blocked:
+            return blocked
+        return store_settings_messages(store=store)
+
+    if kind == "staff_mgmt":
+        store = get_store_for_user(user_id)
+        if store is None:
+            return _decorate_menu(user_id, [{"type": "text", "text": need_register_text()}])
+        if not is_user_manager(store, user_id):
+            return [{"type": "text", "text": "スタッフ管理は店長のみです。"}]
+        blocked = _menu_or_consent(user_id, store)
+        if blocked:
+            return blocked
+        return staff_mgmt_messages(store=store)
+
+    if kind == "payroll_menu":
+        store = get_store_for_user(user_id)
+        if store is None:
+            return _decorate_menu(user_id, [{"type": "text", "text": need_register_text()}])
+        if not is_user_manager(store, user_id):
+            return [{"type": "text", "text": "人件費・給与メニューは店長のみです。"}]
+        blocked = _menu_or_consent(user_id, store)
+        if blocked:
+            return blocked
+        return payroll_menu_messages()
+
+    if kind == "month_status":
+        # 今月の給与＋予算ダッシュボード（既存 payroll_month を再利用）
+        intent = {"intent": "payroll_month", "raw": text, "month": "今月"}
+        kind = "payroll_month"
 
     def _require_store() -> tuple[dict[str, Any] | None, list[dict[str, Any]] | None]:
         store = get_store_for_user(user_id)
@@ -168,7 +340,10 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
             }]
         terms = manager_terms_status(store, user_id)
         if not terms.get("consented"):
-            return [{"type": "text", "text": caution_prompt(acknowledged=bool(terms.get("acknowledged")))}]
+            return _consent_messages(
+                caution_prompt(acknowledged=bool(terms.get("acknowledged"))),
+                acknowledged=bool(terms.get("acknowledged")),
+            )
         return None
 
     def _resolve_who(store: dict[str, Any], who: str | None) -> dict[str, Any] | None:
@@ -189,7 +364,7 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
 
     # ---- 販売版の注意事項・同意（店長機能の入口） ----
     if kind == "show_terms":
-        return [{"type": "text", "text": CAUTION_TEXT}]
+        return _consent_messages(CAUTION_TEXT, acknowledged=False)
 
     if kind in {"ack_terms", "agree"}:
         store = get_store_for_user(user_id)
@@ -199,12 +374,13 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
             return [{"type": "text", "text": "この同意フローは店長のみです。"}]
         if kind == "ack_terms":
             ok, note = acknowledge_manager_terms(user_id)
-            return [{"type": "text", "text": note}]
+            # After ack, offer agree button
+            return _consent_messages(note, acknowledged=True)
         # 「同意する」は、未同意なら規約同意、保留中の給与確定があればその確定にも使う。
         status = manager_terms_status(store, user_id)
         if not status.get("consented"):
             ok, note = consent_manager_terms(user_id)
-            return [{"type": "text", "text": note}]
+            return _decorate_menu(user_id, [{"type": "text", "text": note}])
         pending = get_pending_payroll_lock(store, user_id)
         if pending:
             kind = "payroll_lock_confirm"
@@ -242,13 +418,11 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
             body = (
                 f"{note}\n"
                 f"店舗ID: {store['store_id']}\n"
-                f"これで「希望休 日曜」「シフト見せて」が使えます。\n"
-                f"店長は「シフト3案作って」も利用可。\n"
+                f"下のボタン、または「メニュー」「希望休」「自分のシフト」が使えます。\n"
                 f"{POC_BRANDING_COPY}"
             )
-        else:
-            body = note
-        return [{"type": "text", "text": body}]
+            return _decorate_menu(user_id, [{"type": "text", "text": body}])
+        return [{"type": "text", "text": note}]
 
     if kind == "register_manager":
         if (intent.get("invite_code") or "").upper() == "DEMO01":
@@ -258,14 +432,16 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
             intent.get("invite_code") or "",
             display_name=intent.get("display_name"),
         )
-        body = note if not ok else (
+        if not ok:
+            return [{"type": "text", "text": note}]
+        # Gate: show caution with ack button; menu after consent
+        body = (
             f"{note}\n"
             f"{CAUTION_TEXT}\n\n"
-            f"店長コマンド: 「シフト3案作って」「今週の人件費見せて」"
-            f"「人件費予算 200000」「給与 今月」「確定」\n"
+            f"下のボタンで確認→同意後、店長メニューが使えます。\n"
             f"{POC_BRANDING_COPY}"
         )
-        return [{"type": "text", "text": body}]
+        return _consent_messages(body, acknowledged=False)
 
     if kind in {"register_incomplete", "register_manager_incomplete", "create_store_incomplete"}:
         return [{
@@ -283,12 +459,11 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
             body = (
                 f"{note}\n"
                 f"{CAUTION_TEXT}\n\n"
-                f"店長コマンド: 「シフト3案作って」「給与 今月」「人件費予算 200000」\n"
+                f"下のボタンで確認→同意後、店長メニュー（店舗設定｜スタッフ管理｜シフト作成｜人件費・給与｜今月の状況）が使えます。\n"
                 f"{POC_BRANDING_COPY}"
             )
-        else:
-            body = note
-        return [{"type": "text", "text": body}]
+            return _consent_messages(body, acknowledged=False)
+        return [{"type": "text", "text": note}]
 
     if kind == "set_name":
         ok, note, store = set_member_display_name(
@@ -296,18 +471,24 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
         )
         if ok:
             note = f"{note}\n{POC_BRANDING_COPY}"
-        return [{"type": "text", "text": note}]
+        return _decorate_menu(user_id, [{"type": "text", "text": note}])
 
     if kind == "set_name_incomplete":
-        return [{
-            "type": "text",
-            "text": intent.get("hint", "") + "\n\n" + help_text(),
-        }]
+        hint = intent.get("hint") or "「名前 太郎」のように表示名を送ってください。"
+        return _decorate_menu(user_id, [{"type": "text", "text": hint}])
 
-    if kind == "help" or kind == "set_pref_incomplete":
+    if kind == "set_pref_incomplete":
+        # Button-first: show day picker instead of dumping full help
+        hint = intent.get("hint") or "希望休の曜日を選んでください。"
+        msgs = pref_picker_messages()
+        msgs[0] = with_quick_reply(
+            {"type": "text", "text": hint + "\n\n" + (msgs[0].get("text") or "")},
+            (msgs[0].get("quickReply") or {}).get("items") or [],
+        )
+        return msgs
+
+    if kind == "help":
         msg = help_text()
-        if kind == "set_pref_incomplete":
-            msg = intent.get("hint", "") + "\n\n" + msg
         store = get_store_for_user(user_id)
         if store:
             member = get_member(store, user_id) or {}
@@ -322,7 +503,7 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
             )
         else:
             msg = need_register_text() + "\n\n" + msg
-        return [{"type": "text", "text": msg}]
+        return _decorate_menu(user_id, [{"type": "text", "text": msg}])
 
     # ---- profile: wage / hour cap / role / premium ----
     if kind == "set_wage":
@@ -630,14 +811,12 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
         year, month = ym
         assert store is not None
         set_pending_payroll_lock(store["store_id"], user_id, year, month)
-        return [{
-            "type": "text",
-            "text": (
-                f"{PAYROLL_CONFIRMATION}\n\n"
-                f"対象: {year}年{month}月\n"
-                "内容を確認したら「同意する」または「確定する」と送ってください。"
-            ),
-        }]
+        body = (
+            f"{PAYROLL_CONFIRMATION}\n\n"
+            f"対象: {year}年{month}月\n"
+            "内容を確認したら下のボタン、または「同意する」「確定する」と送ってください。"
+        )
+        return [with_quick_reply({"type": "text", "text": body}, payroll_confirm_items())]
 
     if kind == "payroll_payslip":
         store, err = _require_store()
@@ -772,10 +951,11 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
         # LINE reply max 5 messages; text can be long — trim if needed
         if len(text_body) > 4500:
             text_body = text_body[:4400] + "\n…(省略)"
-        return [
+        msgs = [
             {"type": "text", "text": text_body},
             build_plans_flex(bundle, alt_text=header),
         ]
+        return attach_quick_reply_to_last(msgs, manager_menu_items())
 
     if kind == "show_labor_cost":
         store, err = _require_store()
@@ -878,7 +1058,7 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
             f"通知: {bc.get('detail')}\n"
             f"（対象 {len(bc.get('targets') or [])} 名）"
         )
-        return [{"type": "text", "text": reply}]
+        return _decorate_menu(user_id, [{"type": "text", "text": reply}])
 
     if kind == "show_own_shift":
         store, err = _require_store()
@@ -901,7 +1081,7 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
             note_src = "（確定シフト）"
         dn = (member or {}).get("display_name") or wid
         body = format_own_shift_text(schedule, sc, wid, display_name=dn) + f"\n{note_src}"
-        return [{"type": "text", "text": body}]
+        return _decorate_menu(user_id, [{"type": "text", "text": body}])
 
     # show_shift（既定）
     store, err = _require_store()
@@ -943,11 +1123,13 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
         header = f"今週のシフト案です。\n{POC_BRANDING_COPY}"
         if store:
             header = f"「{store['store_name']}」の今週のシフト案です。\n{POC_BRANDING_COPY}"
-    return [
-        {"type": "text", "text": header},
-        build_shift_flex(result),
-    ]
-
+    return _decorate_menu(
+        user_id,
+        [
+            {"type": "text", "text": header},
+            build_shift_flex(result),
+        ],
+    )
 
 
 def process_event(event: dict[str, Any]) -> dict[str, Any] | None:
@@ -958,20 +1140,35 @@ def process_event(event: dict[str, Any]) -> dict[str, Any] | None:
     user_id = source.get("userId") or "anonymous"
 
     if etype == "follow":
-        messages = [{"type": "text", "text": canned_follow_reply()}]
+        messages = [
+            with_quick_reply(
+                {"type": "text", "text": canned_follow_reply()},
+                guest_menu_items(),
+            )
+        ]
+        return reply_messages(reply_token, messages)
+
+    if etype == "postback":
+        data = ((event.get("postback") or {}).get("data")) or ""
+        LOG.info("postback from %s: %s", user_id, data[:200])
+        messages = handle_postback_message(user_id, data)
         return reply_messages(reply_token, messages)
 
     if etype == "message":
         msg = event.get("message") or {}
         if msg.get("type") != "text":
             messages = [
-                {
-                    "type": "text",
-                    "text": (
-                        "テキストで「登録 店舗コード」「シフト3案作って」"
-                        "「シフト見せて」「希望休 日曜」などと送ってください。"
-                    ),
-                }
+                with_quick_reply(
+                    {
+                        "type": "text",
+                        "text": (
+                            "ボタンまたはテキストで操作できます。\n"
+                            "「メニュー」「登録 店舗コード」「シフト見せて」"
+                            "「希望休 日曜」など。"
+                        ),
+                    },
+                    guest_menu_items(),
+                )
             ]
             return reply_messages(reply_token, messages)
         text = msg.get("text") or ""
@@ -1108,11 +1305,17 @@ def demo_message():
     """資格情報なしのローカル確認用。
 
     JSON: {"text":"登録 DEMO01","userId":"Udemo"}
+         {"postback":"v=1&action=manager_menu","userId":"Udemo"}
     """
     data = request.get_json(silent=True) or {}
-    text = data.get("text") or "シフト見せて"
     user_id = data.get("userId") or "Udemo"
-    messages = handle_text_message(user_id, text)
+    postback = data.get("postback")
+    text = data.get("text")
+    if postback:
+        messages = handle_postback_message(user_id, postback or "")
+    else:
+        text = text or "シフト見せて"
+        messages = handle_text_message(user_id, text)
     preview_text = None
     store = get_store_for_user(user_id)
     for m in messages:
@@ -1126,7 +1329,7 @@ def demo_message():
         {
             "ok": True,
             "status": connection_status(),
-            "input": {"text": text, "userId": user_id},
+            "input": {"text": text, "postback": postback, "userId": user_id},
             "store": (
                 {
                     "store_id": store["store_id"],
