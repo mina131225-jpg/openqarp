@@ -42,8 +42,75 @@ def public_base_url() -> str:
     return f"http://{host}:{port}"
 
 
+DEV_WEBHOOK_SECRET = "dev-payment-webhook-secret"
+
+
 def webhook_secret() -> str:
-    return (os.environ.get("PAYMENT_WEBHOOK_SECRET") or "dev-payment-webhook-secret").strip()
+    return (os.environ.get("PAYMENT_WEBHOOK_SECRET") or DEV_WEBHOOK_SECRET).strip()
+
+
+def webhook_secret_is_dev_default() -> bool:
+    """PAYMENT_WEBHOOK_SECRET 未設定（公開リポジトリ上の既定値）なら True。"""
+    return webhook_secret() == DEV_WEBHOOK_SECRET
+
+
+# ---- モック決済のワンタイム署名トークン -------------------------------------
+# 店長の LINE リクエストで作られた checkout セッションにだけ紐づく。
+# 形式: "<exp>.<nonce>.<hmac>"  hmac = HMAC-SHA256(key, session_id|store_id|plan|exp|nonce)
+# 有効期限 15 分・1回限り（使用済み nonce はセッションに記録）。
+MOCK_PAY_TOKEN_TTL_SEC = 15 * 60
+_PROCESS_TOKEN_KEY = secrets.token_bytes(32)
+
+
+def _mock_token_key() -> bytes:
+    env = (os.environ.get("MOCK_PAY_TOKEN_SECRET") or "").strip()
+    return env.encode("utf-8") if env else _PROCESS_TOKEN_KEY
+
+
+def _mock_token_mac(sess: dict[str, Any], exp: int, nonce: str) -> str:
+    msg = "|".join([str(sess.get("session_id")), str(sess.get("store_id")), str(sess.get("plan")), str(exp), nonce])
+    return hmac.new(_mock_token_key(), msg.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def issue_mock_pay_token(session_id: str, *, now: float | None = None) -> str:
+    sess = _SESSIONS.get(session_id)
+    if not sess:
+        raise KeyError("session not found")
+    exp = int((now if now is not None else time.time()) + MOCK_PAY_TOKEN_TTL_SEC)
+    nonce = secrets.token_urlsafe(12)
+    sess.setdefault("meta", {})["pay_nonce"] = nonce
+    sess["meta"]["pay_token_exp"] = exp
+    sess["meta"]["pay_token_used"] = False
+    return f"{exp}.{nonce}.{_mock_token_mac(sess, exp, nonce)}"
+
+
+def check_mock_pay_token(session_id: str, token: str | None, *, now: float | None = None) -> str | None:
+    """None=有効。それ以外は拒否理由（expired / used / invalid / session）。消費はしない。"""
+    sess = _SESSIONS.get(session_id or "")
+    if not sess:
+        return "session"
+    try:
+        exp_s, nonce, mac = (token or "").split(".", 2)
+        exp = int(exp_s)
+    except ValueError:
+        return "invalid"
+    meta = sess.get("meta") or {}
+    if not hmac.compare_digest(_mock_token_mac(sess, exp, nonce), mac):
+        return "invalid"
+    if nonce != meta.get("pay_nonce"):
+        return "invalid"
+    if meta.get("pay_token_used") or sess.get("status") == "completed":
+        return "used"
+    if (now if now is not None else time.time()) > exp:
+        return "expired"
+    return None
+
+
+def consume_mock_pay_token(session_id: str, token: str | None, *, now: float | None = None) -> str | None:
+    err = check_mock_pay_token(session_id, token, now=now)
+    if err is None:
+        _SESSIONS[session_id]["meta"]["pay_token_used"] = True
+    return err
 
 
 def sign_payload(body: bytes, *, secret: str | None = None) -> str:
@@ -153,6 +220,9 @@ class MockPaymentProvider(PaymentProvider):
             meta={"provider": self.name},
         )
         _SESSIONS[sid] = sess.to_dict()
+        token = issue_mock_pay_token(sid)
+        sess.checkout_url = checkout + "&t=" + urllib.parse.quote(token, safe="")
+        _SESSIONS[sid]["checkout_url"] = sess.checkout_url
         return sess
 
     def complete_session(self, session_id: str) -> dict[str, Any]:

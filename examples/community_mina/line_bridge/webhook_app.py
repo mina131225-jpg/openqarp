@@ -116,7 +116,10 @@ from billing import (  # noqa: E402
 )
 from payment_provider import (  # noqa: E402
     MockPaymentProvider,
+    check_mock_pay_token,
+    consume_mock_pay_token,
     get_payment_provider,
+    webhook_secret_is_dev_default,
     period_end_iso,
     public_base_url,
     sign_payload,
@@ -2134,14 +2137,24 @@ def billing_checkout():
     session_id = (request.args.get("session_id") or "").strip()
     provider = get_payment_provider()
     sess = provider.get_session(session_id) if session_id else None
+    if not sess and not _local_or_admin():
+        return _pay_denied_page("invalid"), 403
     if not sess:
         return (
             "<!doctype html><html><body><h1>Checkout session not found</h1>"
             "<p><a href='/miniapp'>ミニアプリへ戻る</a></p></body></html>"
         ), 404
+    token = (request.args.get("t") or "").strip()
+    if not _local_or_admin():
+        err = check_mock_pay_token(session_id, token)
+        if err is not None:
+            LOG.warning("checkout page denied reason=%s", err)
+            return _pay_denied_page(err), 403
     plan = sess.get("plan")
     amount = sess.get("amount_yen")
     store_id = sess.get("store_id")
+    import html as _html
+    token_attr = _html.escape(token, quote=True)
     # Mock: form posts to mock-pay which fires signed webhook then redirects success
     html = f"""<!doctype html>
 <html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -2155,10 +2168,11 @@ body{{font-family:system-ui,sans-serif;max-width:480px;margin:2rem auto;padding:
 <h1>料金プランお申し込み</h1>
 <div class="card">
 <p><strong>{plan}</strong> — ¥{amount:,}/月</p>
-<p class="muted">店舗ID: {store_id}</p>
+<p class="muted">店舗ID: {_html.escape(str(store_id))}</p>
 <p class="muted">LINE Mini App IAP は都度課金のみのため、定期プランは外部決済（Payment Provider）を使います。</p>
 <form method="post" action="/billing/mock-pay">
-  <input type="hidden" name="session_id" value="{session_id}"/>
+  <input type="hidden" name="session_id" value="{_html.escape(session_id, quote=True)}"/>
+  <input type="hidden" name="t" value="{token_attr}"/>
   <button class="btn" type="submit">支払いを完了する（デモ）</button>
 </form>
 <p class="muted" style="margin-top:1rem"><a href="{sess.get('cancel_url') or '/billing/cancel'}">キャンセル</a></p>
@@ -2178,9 +2192,24 @@ def billing_mock_pay():
         session_id = str(request.json.get("session_id") or "").strip()
     else:
         session_id = (request.args.get("session_id") or "").strip()
+    token = ""
+    if request.form:
+        token = (request.form.get("t") or "").strip()
+    elif request.is_json and request.json:
+        token = str(request.json.get("t") or "").strip()
+    else:
+        token = (request.args.get("t") or "").strip()
     provider = get_payment_provider()
+    if not _local_or_admin():
+        # トンネル経由は「店長の LINE 申し込みで発行された 15分・1回限りの署名トークン」だけ許可
+        if not isinstance(provider, MockPaymentProvider):
+            return _pay_denied_page("invalid"), 403
+        err = consume_mock_pay_token(session_id, token)
+        if err is not None:
+            LOG.warning("mock-pay denied reason=%s", err)
+            return _pay_denied_page(err), 403
     if not isinstance(provider, MockPaymentProvider):
-        # still allow mock completion for local sessions
+        # still allow mock completion for local sessions (local/admin only)
         provider = MockPaymentProvider()
     try:
         body = provider.build_success_webhook_body(session_id)
@@ -2202,6 +2231,21 @@ def billing_mock_pay():
     if status >= 400:
         return jsonify({"ok": False, "result": result}), status
     return redirect(success, code=302)
+
+
+def _pay_denied_page(reason: str | None) -> str:
+    why = {
+        "expired": "このお支払いリンクは有効期限（15分）が切れています。",
+        "used": "このお支払いリンクは使用済みです。",
+    }.get(reason or "", "このお支払いリンクは無効です。")
+    return (
+        "<!doctype html><html lang='ja'><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'><title>403</title></head>"
+        "<body style='font-family:system-ui;max-width:480px;margin:2rem auto;padding:0 1rem'>"
+        f"<h1>お手続きできません</h1><p>{why}</p>"
+        "<p>店長の LINE から「申し込む プロ」（または「プラン」）を送ると、新しいリンクが発行されます。</p>"
+        "<p><a href='https://line.me/R/nv/chat'>LINE に戻る</a></p></body></html>"
+    )
 
 
 def _apply_payment_webhook(body: bytes, headers: dict[str, str]) -> tuple[dict, int]:
@@ -2278,6 +2322,10 @@ def _apply_payment_webhook(body: bytes, headers: dict[str, str]) -> tuple[dict, 
 @app.post("/billing/webhook")
 def billing_webhook():
     """Payment Provider success / lifecycle webhook → attach or revoke plan on store_id."""
+    if webhook_secret_is_dev_default() and not _local_or_admin():
+        # 既定の開発用シークレットは公開リポジトリにあるため、外部からの署名は信用しない
+        LOG.warning("billing webhook denied: PAYMENT_WEBHOOK_SECRET unset and request not local/admin")
+        return jsonify({"ok": False, "error": "forbidden (set PAYMENT_WEBHOOK_SECRET or call locally)"}), 403
     body = request.get_data()
     headers = {k: v for k, v in request.headers.items()}
     result, status = _apply_payment_webhook(body, headers)
@@ -2473,16 +2521,21 @@ def _demo_access_denied():
     """
     if (os.environ.get("LINE_DEMO_ENDPOINT") or "").strip().lower() in {"off", "0", "false", "disabled"}:
         return jsonify({"ok": False, "error": "demo endpoint disabled"}), 404
+    if _local_or_admin():
+        return None
+    LOG.warning("demo endpoint denied remote=%s", request.remote_addr)
+    return jsonify({"ok": False, "error": "forbidden (local only or X-Admin-Token)"}), 403
+
+
+def _local_or_admin() -> bool:
+    """ローカル直アクセス（ループバック かつ トンネル／プロキシヘッダ無し）または X-Admin-Token 一致。"""
     admin = (os.environ.get("LINE_DEMO_ADMIN_TOKEN") or os.environ.get("LINE_STORES_ADMIN_TOKEN") or "").strip()
     got = (request.headers.get("X-Admin-Token") or "").strip()
     if admin and got and len(got) == len(admin) and hmac.compare_digest(got, admin):
-        return None
+        return True
     remote = (request.remote_addr or "").strip()
     proxied = any(request.headers.get(h) for h in _PROXY_HEADERS)
-    if remote in _LOOPBACK and not proxied:
-        return None
-    LOG.warning("demo endpoint denied remote=%s proxied=%s", remote, proxied)
-    return jsonify({"ok": False, "error": "forbidden (local only or X-Admin-Token)"}), 403
+    return remote in _LOOPBACK and not proxied
 
 
 @app.post("/demo/message")
