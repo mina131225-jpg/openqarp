@@ -979,7 +979,16 @@ def scenario_for_store(store: dict[str, Any] | None) -> dict[str, Any]:
                 return (1, w)
             ordered = sorted(set(member_workers), key=_wid_key)
             sc["workers"] = ordered
-            # preferred_offs keys may reference old slots — keep as-is
+            # 基本シナリオ由来の希望休（例: D）が未参加枠を参照するとソルバ検証で落ちるため、
+            # 実在する枠だけに絞り、最低人数も人数以内に丸める（2〜3名の新規店舗対策）。
+            sc["preferred_offs"] = {
+                w: list(v) for w, v in (sc.get("preferred_offs") or {}).items() if w in ordered
+            }
+            n = len(ordered)
+            if n >= 1:
+                sc["min_staff_per_day"] = max(1, min(int(sc.get("min_staff_per_day") or 1), n - 1 if n > 2 else n))
+                if "qaoa_needed_on_focus" in sc:
+                    sc["qaoa_needed_on_focus"] = max(1, min(int(sc["qaoa_needed_on_focus"]), n))
     # 予定人件費・制約用メタ（ソルバ本体は無視、plans が参照）
     sc["_store_id"] = store.get("store_id")
     return sc

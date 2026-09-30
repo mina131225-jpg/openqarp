@@ -41,7 +41,7 @@ _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
-from notify import broadcast_to_store, reply_messages  # noqa: E402
+from notify import broadcast_to_store, push_messages, reply_messages  # noqa: E402
 from plans import (  # noqa: E402
     POC_FOOTER,
     bundle_for_storage,
@@ -62,6 +62,7 @@ from shift_messages import (  # noqa: E402
     connection_status,
     get_line_credentials,
     help_text,
+    load_base_scenario,
     need_register_text,
     POC_BRANDING_COPY,
     parse_user_intent,
@@ -75,8 +76,15 @@ from stores import (  # noqa: E402
     create_store_as_manager,
     display_labels_for_store,
     ensure_demo_store,
+    ensure_referral_code,
     get_member,
     get_pending_payroll_lock,
+    get_store_by_invite,
+    get_user_state,
+    manager_user_ids,
+    mark_onboarding,
+    set_referred_by,
+    set_user_state,
     get_store,
     get_store_for_user,
     is_user_manager,
@@ -135,6 +143,14 @@ from line_ui import (  # noqa: E402
     store_settings_messages,
     with_quick_reply,
 )
+
+import onboarding as ob  # noqa: E402
+from invite_share import (  # noqa: E402
+    invite_landing_html,
+    invite_qr_png,
+    valid_code,
+)
+from line_ui import ONBOARDING_ACTIONS  # noqa: E402
 
 from payroll import (  # noqa: E402
     build_staff_forecast,
@@ -247,6 +263,271 @@ def _checkout_urls_for_store(store_id: str, user_id: str) -> dict[str, str]:
     return out
 
 
+# ---- 3分オンボーディング／招待・紹介 ------------------------------------------
+
+# テスト・監査用: 直近の参加通知（店長宛て push の本文）。userId 等は含めない。
+JOIN_NOTICES: list[dict[str, Any]] = []
+
+
+def _text(body: str) -> dict[str, Any]:
+    return {"type": "text", "text": body}
+
+
+def _looks_like_command(text: str) -> bool:
+    if ob.parse_onboarding_text(text) is not None:
+        return True
+    kind = parse_user_intent(text).get("intent")
+    if kind != "help":
+        return True
+    import re as _re
+    return bool(_re.search(r"ヘルプ|使い方|help|メニュー", text or "", _re.I))
+
+
+def follow_messages(user_id: str) -> list[dict[str, Any]]:
+    """友だち追加時: 新規はウェルカム（店長／スタッフ）、既存は「続きから」。"""
+    store = get_store_for_user(user_id)
+    if store is None:
+        return ob.welcome_messages()
+    if is_user_manager(store, user_id):
+        return [with_quick_reply(
+            _text(f"おかえりなさい。「{store['store_name']}」の店長として登録済みです。"),
+            ob.resume_items(),
+        )]
+    return [with_quick_reply(
+        _text(f"おかえりなさい。「{store['store_name']}」に登録済みです。"),
+        staff_menu_items(),
+    )]
+
+
+def _manager_gate(user_id: str) -> tuple[dict[str, Any] | None, list[dict[str, Any]] | None]:
+    store = get_store_for_user(user_id)
+    if store is None:
+        return None, ob.welcome_messages()
+    if not is_user_manager(store, user_id):
+        return None, _decorate_menu(user_id, [_text("この操作は店長のみです。")])
+    blocked = _menu_or_consent(user_id, store)
+    if blocked:
+        return None, blocked
+    return store, None
+
+
+def _consented(store: dict[str, Any] | None, user_id: str) -> bool:
+    return bool(store) and bool(manager_terms_status(store, user_id).get("consented"))
+
+
+def _invite_step(user_id: str, store: dict[str, Any]) -> list[dict[str, Any]]:
+    status = ob.setup_status(store, consented=_consented(store, user_id))
+    msgs = ob.invite_step_messages(store, status, public_base_url())
+    mark_onboarding(store["store_id"], "invite_shown")
+    return msgs
+
+
+def _notify_join(store: dict[str, Any], user_id: str) -> dict[str, Any] | None:
+    fresh = get_store(store["store_id"]) or store
+    member = get_member(fresh, user_id) or {}
+    if member.get("is_manager"):
+        return None
+    body = ob.join_notice_text(fresh, member.get("display_name"), member.get("worker_id"))
+    targets = [u for u in manager_user_ids(fresh) if u != user_id]
+    results = []
+    for mgr in targets:
+        r = push_messages(
+            mgr,
+            messages=[with_quick_reply(_text(body), [
+                qr_postback_item("スタッフ管理", "staff_mgmt"),
+                qr_postback_item("シフト作成", "make_three_plans"),
+            ])],
+        )
+        results.append({"mode": r.get("mode"), "sent": r.get("sent")})
+    record = {"store_id": fresh["store_id"], "text": body, "targets": len(targets), "results": results}
+    JOIN_NOTICES.append(record)
+    del JOIN_NOTICES[:-50]
+    return record
+
+
+def qr_postback_item(label: str, action: str) -> dict[str, Any]:
+    from line_ui import encode_postback, qr_postback
+    return qr_postback(label, encode_postback(action=action), display_text=label)
+
+
+def _register_staff(user_id: str, code: str, display_name: str | None) -> list[dict[str, Any]]:
+    target = get_store_by_invite(code)
+    prior = get_store_for_user(user_id)
+    already = bool(target and prior and prior["store_id"] == target["store_id"])
+    ok, note, store = register_user(
+        user_id, code, display_name=display_name, worker_alias=display_name
+    )
+    if not (ok and store):
+        return [_text(note)]
+    set_user_state(user_id, None)
+    body = (
+        f"{note}\n"
+        f"店舗ID: {store['store_id']}\n"
+        f"下のボタン、または「メニュー」「希望休」「自分のシフト」が使えます。\n"
+        f"{POC_BRANDING_COPY}"
+    )
+    member = get_member(store, user_id) or {}
+    if already or member.get("is_manager"):
+        return _decorate_menu(user_id, [_text(body)])
+    if member.get("display_name"):
+        _notify_join(store, user_id)
+        return _decorate_menu(user_id, [_text(body)])
+    # 名前が未設定 → 名前を聞いてから店長へ参加通知
+    set_user_state(user_id, {"kind": "await_name", "store_id": store["store_id"]})
+    return ob.ask_name_messages(store["store_name"])
+
+
+def _handle_pending_input(user_id: str, text: str, state: dict[str, Any]) -> list[dict[str, Any]] | None:
+    """入力待ち状態の処理。None なら通常ディスパッチへ。"""
+    kind = state.get("kind")
+    raw = (text or "").strip().replace("\u3000", " ")
+    if kind == "await_store_name":
+        if _looks_like_command(raw):
+            set_user_state(user_id, None)
+            return None
+        if len(raw) > 40:
+            return [_text("店舗名は40文字以内で送ってください。")] + ob.ask_store_name_messages()
+        set_user_state(user_id, None)
+        return handle_text_message(user_id, f"店舗作成 {raw}")
+    if kind == "await_invite_code":
+        code = valid_code(raw.replace(" ", ""))
+        if code:
+            if code == "DEMO01":
+                ensure_demo_store()
+            if get_store_by_invite(code) is None:
+                return [_text(f"招待コード「{code}」が見つかりません。店長から届いたコードをもう一度確認してください。")] + ob.ask_invite_code_messages()
+            return _register_staff(user_id, code, None)
+        if _looks_like_command(raw):
+            set_user_state(user_id, None)
+            return None
+        return [_text("招待コードは6文字の英数字です（例: AB12CD）。")] + ob.ask_invite_code_messages()
+    if kind == "await_name":
+        if _looks_like_command(raw):
+            set_user_state(user_id, None)
+            return None
+        ok, note, store = set_member_display_name(user_id, raw)
+        if not ok or store is None:
+            return [_text(note)]
+        set_user_state(user_id, None)
+        _notify_join(store, user_id)
+        return _decorate_menu(user_id, [_text(f"{note}\n準備完了です。希望休はボタンから出せます。")])
+    set_user_state(user_id, None)
+    return None
+
+
+def _sample_plans(user_id: str) -> list[dict[str, Any]]:
+    store, err = _manager_gate(user_id)
+    if err:
+        return err
+    assert store is not None
+    if ob.real_staff_count(store) >= 2:
+        return handle_text_message(user_id, "シフト3案作って")
+    sc = ob.sample_scenario(load_base_scenario())
+    bundle = generate_three_plans(sc, None)
+    body = format_plans_text(bundle, store_name=f"{store['store_name']}（サンプル）")
+    body = body.replace(
+        "確定する案を選んで「確定」「確定 希望」「確定 2」などと送ってください。",
+        "※ サンプルのため確定・スタッフ通知はされません。",
+    )
+    text_body = ob.sample_intro_text() + "\n\n" + body
+    if len(text_body) > 4500:
+        text_body = text_body[:4400] + "\n…(省略)"
+    flex = ob.strip_confirm_buttons(build_plans_flex(bundle, alt_text="シフト3案"))
+    store = mark_onboarding(store["store_id"], "first_plan") or store
+    status = ob.setup_status(store, consented=True)
+    return [_text(text_body), flex] + ob.after_sample_messages(status)
+
+
+def _resume(user_id: str) -> list[dict[str, Any]]:
+    store = get_store_for_user(user_id)
+    if store is None:
+        st = get_user_state(user_id) or {}
+        if st.get("kind") == "await_store_name":
+            return ob.ask_store_name_messages()
+        if st.get("kind") == "await_invite_code":
+            return ob.ask_invite_code_messages()
+        return ob.welcome_messages()
+    if not is_user_manager(store, user_id):
+        return handle_text_message(user_id, "スタッフメニュー")
+    consented = _consented(store, user_id)
+    status = ob.setup_status(store, consented=consented)
+    nxt = status["next"]
+    if nxt == "consent":
+        terms = manager_terms_status(store, user_id)
+        ack = bool(terms.get("acknowledged"))
+        return _consent_messages(
+            ob.progress_text(status) + "\n\n" + caution_prompt(acknowledged=ack),
+            acknowledged=ack,
+        )
+    if nxt == "invite":
+        return _invite_step(user_id, store)
+    if nxt == "first_plan":
+        return ob.first_plan_messages(status, can_real=ob.real_staff_count(store) >= 2)
+    flex = build_manager_menu_flex(store_name=store.get("store_name"))
+    return attach_quick_reply_to_last(
+        [_text(ob.setup_done_text(status)), flex], manager_menu_items()
+    )
+
+
+def _onboarding_action(user_id: str, kind: str, intent: dict[str, Any]) -> list[dict[str, Any]]:
+    if kind == "onboard_manager":
+        store = get_store_for_user(user_id)
+        if store is not None:
+            if is_user_manager(store, user_id):
+                return _resume(user_id)
+            return _decorate_menu(user_id, [_text(
+                f"既に「{store['store_name']}」のスタッフとして登録されています。"
+                "別のお店を開く場合は「店舗作成 店舗名」と送ってください。"
+            )])
+        set_user_state(user_id, {"kind": "await_store_name"})
+        return ob.ask_store_name_messages()
+    if kind == "onboard_staff":
+        store = get_store_for_user(user_id)
+        if store is not None:
+            return handle_text_message(user_id, "スタッフメニュー")
+        set_user_state(user_id, {"kind": "await_invite_code"})
+        return ob.ask_invite_code_messages()
+    if kind == "cancel_input":
+        set_user_state(user_id, None)
+        if get_store_for_user(user_id) is None:
+            return [_text("キャンセルしました。")] + ob.welcome_messages()
+        return _decorate_menu(user_id, [_text("キャンセルしました。")])
+    if kind == "skip_name":
+        st = get_user_state(user_id) or {}
+        set_user_state(user_id, None)
+        store = get_store_for_user(user_id)
+        if store and st.get("kind") == "await_name":
+            _notify_join(store, user_id)
+        return _decorate_menu(user_id, [_text("あとで「名前 太郎」のように設定できます。")])
+    if kind == "resume_setup":
+        return _resume(user_id)
+    if kind == "show_invite":
+        store, err = _manager_gate(user_id)
+        return err if err else _invite_step(user_id, store)  # type: ignore[arg-type]
+    if kind == "invite_qr":
+        store, err = _manager_gate(user_id)
+        if err:
+            return err
+        assert store is not None
+        mark_onboarding(store["store_id"], "invite_shown")
+        return ob.invite_qr_messages(store, public_base_url())
+    if kind == "sample_plans":
+        return _sample_plans(user_id)
+    if kind == "refer_service":
+        store = get_store_for_user(user_id)
+        code = None
+        if store and is_user_manager(store, user_id):
+            code = ensure_referral_code(store["store_id"])
+        return ob.refer_messages(code)
+    if kind == "apply_referral":
+        store = get_store_for_user(user_id)
+        if store is None or not is_user_manager(store, user_id):
+            return [_text("紹介コードは、お店を作成した店長が送ってください（「お店を始める」から開始できます）。")]
+        ok, note = set_referred_by(store["store_id"], intent.get("code") or "")
+        return _decorate_menu(user_id, [_text(note)])
+    return _decorate_menu(user_id, [_text("不明な操作です。「続きから」または「メニュー」を送ってください。")])
+
+
 def handle_postback_message(user_id: str, data: str) -> list[dict[str, Any]]:
     """postback data → messages (reuses text intent dispatch)."""
     intent = postback_to_intent(data)
@@ -257,6 +538,8 @@ def handle_postback_message(user_id: str, data: str) -> list[dict[str, Any]]:
         )
     # Prefer typed text synthesis only when needed; menus go through handle_text_message raw.
     kind = intent.get("intent")
+    if kind in ONBOARDING_ACTIONS:
+        return _onboarding_action(user_id, kind, intent)
     # set_pref_incomplete from prompt_pref → day picker
     if kind == "set_pref_incomplete" and intent.get("via") == "postback":
         return pref_picker_messages()
@@ -308,6 +591,14 @@ def handle_postback_message(user_id: str, data: str) -> list[dict[str, Any]]:
 
 def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
     """テキスト意図 → LINE messages[]（店舗単位）。"""
+    ob_intent = ob.parse_onboarding_text(text)
+    if ob_intent is not None:
+        return _onboarding_action(user_id, ob_intent["intent"], ob_intent)
+    state = get_user_state(user_id)
+    if state:
+        handled = _handle_pending_input(user_id, text, state)
+        if handled is not None:
+            return handled
     intent = parse_user_intent(text)
     kind = intent.get("intent")
 
@@ -546,7 +837,14 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
         status = manager_terms_status(store, user_id)
         if not status.get("consented"):
             ok, note = consent_manager_terms(user_id)
-            return _decorate_menu(user_id, [{"type": "text", "text": note}])
+            if not ok:
+                return _decorate_menu(user_id, [{"type": "text", "text": note}])
+            store = get_store_for_user(user_id) or store
+            head = {
+                "type": "text",
+                "text": f"{note}\n{ob.trial_started_text(store)}",
+            }
+            return [head] + _invite_step(user_id, store)
         pending = get_pending_payroll_lock(store, user_id)
         if pending:
             kind = "payroll_lock_confirm"
@@ -586,21 +884,9 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
     if kind == "register":
         if (intent.get("invite_code") or "").upper() == "DEMO01":
             ensure_demo_store()
-        ok, note, store = register_user(
-            user_id,
-            intent.get("invite_code") or "",
-            display_name=intent.get("display_name"),
-            worker_alias=intent.get("display_name"),
+        return _register_staff(
+            user_id, intent.get("invite_code") or "", intent.get("display_name")
         )
-        if ok and store:
-            body = (
-                f"{note}\n"
-                f"店舗ID: {store['store_id']}\n"
-                f"下のボタン、または「メニュー」「希望休」「自分のシフト」が使えます。\n"
-                f"{POC_BRANDING_COPY}"
-            )
-            return _decorate_menu(user_id, [{"type": "text", "text": body}])
-        return [{"type": "text", "text": note}]
 
     if kind == "register_manager":
         if (intent.get("invite_code") or "").upper() == "DEMO01":
@@ -634,8 +920,12 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
             display_name=intent.get("display_name"),
         )
         if ok and store:
+            set_user_state(user_id, None)
+            mark_onboarding(store["store_id"], "store_created")
+            status = ob.setup_status(store, consented=False)
             body = (
-                f"{note}\n"
+                f"{note}\n\n"
+                f"{ob.progress_text(status)}\n\n"
                 f"{CAUTION_TEXT}\n\n"
                 f"下のボタンで確認→同意後、店長メニュー（店舗設定｜スタッフ管理｜シフト作成｜人件費・給与｜今月の状況）が使えます。\n"
                 f"{POC_BRANDING_COPY}"
@@ -1157,6 +1447,7 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
                 "reason": "QAOA比較はプロプラン機能です",
             }
         set_pending_plans(store["store_id"], bundle_for_storage(bundle))
+        mark_onboarding(store["store_id"], "first_plan")
         # refresh store name
         store = get_store_for_user(user_id) or store
         text_body = header + "\n\n" + format_plans_text(bundle, store_name=store.get("store_name"))
@@ -1355,13 +1646,7 @@ def process_event(event: dict[str, Any]) -> dict[str, Any] | None:
     user_id = source.get("userId") or "anonymous"
 
     if etype == "follow":
-        messages = [
-            with_quick_reply(
-                {"type": "text", "text": canned_follow_reply()},
-                guest_menu_items(),
-            )
-        ]
-        return reply_messages(reply_token, messages)
+        return reply_messages(reply_token, follow_messages(user_id))
 
     if etype == "postback":
         data = ((event.get("postback") or {}).get("data")) or ""
@@ -1414,6 +1699,8 @@ def index():
                 "billing_success": "GET /billing/success",
                 "miniapp": "GET /miniapp",
                 "legal_terms": "GET /legal/terms",
+                "invite_page": "GET /invite/<code>",
+                "invite_qr": "GET /invite/<code>/qr.png",
             },
             "note": (
                 "販売時は顧客の LINE 公式を使う想定です。"
@@ -1710,6 +1997,38 @@ def legal_cancel_refund():
     body = _read_legal_md("解約・返金ポリシー.md")
     return Response(f"<pre style='white-space:pre-wrap;font-family:system-ui;max-width:720px;margin:1rem auto'>{body}</pre>", mimetype="text/html")
 
+
+
+@app.get("/invite/<code>")
+def invite_page(code: str):
+    """スタッフ向け招待ページ（店舗名＋招待コードのみ表示）。"""
+    c = valid_code(code)
+    store = get_store_by_invite(c) if c else None
+    if not store:
+        return Response(
+            "<!doctype html><html lang='ja'><meta charset='utf-8'>"
+            "<body style='font-family:system-ui;max-width:440px;margin:2rem auto'>"
+            "<h1>招待コードが見つかりません</h1><p>店長に招待コードを確認してください。</p></body></html>",
+            status=404,
+            mimetype="text/html",
+        )
+    resp = Response(invite_landing_html(store["store_name"], store["invite_code"]), mimetype="text/html")
+    resp.headers["X-Robots-Tag"] = "noindex"
+    resp.headers["Referrer-Policy"] = "no-referrer"
+    return resp
+
+
+@app.get("/invite/<code>/qr.png")
+def invite_qr(code: str):
+    c = valid_code(code)
+    store = get_store_by_invite(c) if c else None
+    if not store:
+        return Response(b"not found", status=404, mimetype="text/plain")
+    png = invite_qr_png(store["store_name"], store["invite_code"])
+    resp = Response(png, mimetype="image/png")
+    resp.headers["Cache-Control"] = "public, max-age=300"
+    resp.headers["X-Robots-Tag"] = "noindex"
+    return resp
 
 
 @app.post("/webhook")

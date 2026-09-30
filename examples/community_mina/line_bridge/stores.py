@@ -1129,3 +1129,108 @@ def ensure_demo_store(
     if existing:
         return existing
     return create_store(store_name, invite_code=invite_code)
+
+
+# ---- onboarding / user state / referral (3-minute setup) --------------------
+
+def _user_states_unlocked(db: dict[str, Any]) -> dict[str, Any]:
+    return db.setdefault("user_states", {})
+
+
+def get_user_state(user_id: str) -> dict[str, Any] | None:
+    """会話の一時状態（例: 店舗名の入力待ち）。店舗に紐付かない userId でも保持。"""
+    uid = (user_id or "").strip()
+    if not uid:
+        return None
+    with _LOCK:
+        db = _load_unlocked()
+        st = (db.get("user_states") or {}).get(uid)
+        return deepcopy(st) if isinstance(st, dict) else None
+
+
+def set_user_state(user_id: str, state: dict[str, Any] | None) -> None:
+    uid = (user_id or "").strip()
+    if not uid:
+        return
+    with _LOCK:
+        db = _load_unlocked()
+        states = _user_states_unlocked(db)
+        if state:
+            states[uid] = {**state, "updated_at": _now_iso()}
+        else:
+            states.pop(uid, None)
+        _save_unlocked(db)
+
+
+def mark_onboarding(store_id: str, step: str) -> dict[str, Any] | None:
+    """店舗のセットアップ進捗にタイムスタンプを記録（初回のみ）。"""
+    with _LOCK:
+        db = _load_unlocked()
+        store = db["stores"].get(store_id)
+        if not store:
+            return None
+        ob = store.setdefault("onboarding", {})
+        if not ob.get(step):
+            ob[step] = _now_iso()
+            store["updated_at"] = _now_iso()
+            _save_unlocked(db)
+        return deepcopy(store)
+
+
+def ensure_referral_code(store_id: str) -> str | None:
+    """店舗ごとの紹介コード（店舗データは含まない短いコード）。"""
+    with _LOCK:
+        db = _load_unlocked()
+        store = db["stores"].get(store_id)
+        if not store:
+            return None
+        code = store.get("referral_code")
+        if code:
+            return code
+        ref_index = db.setdefault("referral_index", {})
+        code = "R" + generate_invite_code(5)
+        while code in ref_index:
+            code = "R" + generate_invite_code(5)
+        store["referral_code"] = code
+        ref_index[code] = store_id
+        store["updated_at"] = _now_iso()
+        _save_unlocked(db)
+        return code
+
+
+def referral_code_exists(code: str) -> bool:
+    c = (code or "").strip().upper()
+    if not c:
+        return False
+    with _LOCK:
+        db = _load_unlocked()
+        return c in (db.get("referral_index") or {})
+
+
+def set_referred_by(store_id: str, code: str) -> tuple[bool, str]:
+    """紹介コードを店舗に記録（自店舗コード・二重登録は不可）。紹介元の店舗情報は返さない。"""
+    c = (code or "").strip().upper()
+    with _LOCK:
+        db = _load_unlocked()
+        store = db["stores"].get(store_id)
+        if not store:
+            return False, "店舗が見つかりません。"
+        ref_sid = (db.get("referral_index") or {}).get(c)
+        if not ref_sid:
+            return False, f"紹介コード「{c}」が見つかりません。"
+        if ref_sid == store_id:
+            return False, "ご自身の店舗の紹介コードは使えません。"
+        if store.get("referred_by"):
+            return False, "紹介コードは登録済みです。"
+        store["referred_by"] = c
+        store["updated_at"] = _now_iso()
+        _save_unlocked(db)
+    return True, f"紹介コード「{c}」を登録しました。ありがとうございます。"
+
+
+def manager_user_ids(store: dict[str, Any] | None) -> list[str]:
+    return [
+        m["user_id"]
+        for m in (store or {}).get("members") or []
+        if m.get("is_manager") and m.get("user_id")
+    ]

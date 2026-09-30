@@ -11,6 +11,19 @@ from urllib.parse import parse_qs, urlencode
 from plans import POC_FOOTER
 from shift_messages import POC_BRANDING_COPY
 
+# 3分オンボーディング／招待・紹介（onboarding.py で処理）
+ONBOARDING_ACTIONS = frozenset({
+    "onboard_manager",
+    "onboard_staff",
+    "resume_setup",
+    "show_invite",
+    "invite_qr",
+    "sample_plans",
+    "refer_service",
+    "skip_name",
+    "cancel_input",
+})
+
 # ---- postback codec (data <= 300 bytes) ------------------------------------
 
 def encode_postback(**params: str) -> str:
@@ -101,6 +114,8 @@ def postback_to_intent(data: str) -> dict[str, Any] | None:
         return {"intent": "subscribe", "raw": data, "plan": plan, "via": "postback"}
     if action == "legal_links":
         return {"intent": "legal_links", "raw": data, "via": "postback"}
+    if action in ONBOARDING_ACTIONS:
+        return {"intent": action, "raw": data, "via": "postback"}
     return None
 
 
@@ -199,6 +214,7 @@ def manager_menu_items() -> list[dict[str, Any]]:
         qr_postback("人件費・給与", encode_postback(action="payroll_menu"), display_text="人件費・給与"),
         qr_postback("今月の状況", encode_postback(action="month_status"), display_text="今月の状況"),
         qr_postback("料金プラン", encode_postback(action="show_plans"), display_text="料金プラン"),
+        qr_postback("スタッフ招待", encode_postback(action="show_invite"), display_text="スタッフを招待"),
     ]
 
 
@@ -214,6 +230,8 @@ def staff_menu_items() -> list[dict[str, Any]]:
 
 def guest_menu_items() -> list[dict[str, Any]]:
     return [
+        qr_postback("お店を始める（店長）", encode_postback(action="onboard_manager"), display_text="お店を始める（店長）"),
+        qr_postback("スタッフとして参加", encode_postback(action="onboard_staff"), display_text="スタッフとして参加"),
         qr_postback("登録する", encode_postback(action="prompt_register"), display_text="登録"),
         qr_message("登録 DEMO01", "登録 DEMO01"),
         qr_postback("使い方", encode_postback(action="help"), display_text="使い方"),
@@ -271,6 +289,8 @@ def build_manager_menu_flex(*, store_name: str | None = None) -> dict[str, Any]:
         flex_button_postback("人件費・給与", encode_postback(action="payroll_menu"), style="secondary", display_text="人件費・給与"),
         flex_button_postback("今月の状況", encode_postback(action="month_status"), style="secondary", display_text="今月の状況"),
         flex_button_postback("料金プラン", encode_postback(action="show_plans"), style="primary", display_text="料金プラン"),
+        flex_button_postback("スタッフを招待", encode_postback(action="show_invite"), style="secondary", display_text="スタッフを招待"),
+        flex_button_postback("他の店長に紹介", encode_postback(action="refer_service"), style="secondary", display_text="他の店長に紹介"),
     ]
     return {
         "type": "flex",
