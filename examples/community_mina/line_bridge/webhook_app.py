@@ -2085,6 +2085,33 @@ def webhook():
     ), 200
 
 
+_LOOPBACK = {"127.0.0.1", "::1", "localhost"}
+# cloudflared / reverse proxies connect from loopback but add these headers.
+_PROXY_HEADERS = ("Cf-Connecting-Ip", "Cf-Ray", "X-Forwarded-For", "X-Forwarded-Host", "X-Real-Ip", "Forwarded")
+
+
+def _demo_access_denied():
+    """/demo/message は任意 userId になりすませるため、ローカル直アクセス or 管理トークンのみ許可。
+
+    - X-Admin-Token == LINE_DEMO_ADMIN_TOKEN（または LINE_STORES_ADMIN_TOKEN）なら許可
+    - それ以外は remote_addr がループバック かつ プロキシ／トンネル経由ヘッダが無いときだけ許可
+      （cloudflared は 127.0.0.1 から接続するため、ヘッダで外部経由を判定）
+    - LINE_DEMO_ENDPOINT=off で完全無効化
+    """
+    if (os.environ.get("LINE_DEMO_ENDPOINT") or "").strip().lower() in {"off", "0", "false", "disabled"}:
+        return jsonify({"ok": False, "error": "demo endpoint disabled"}), 404
+    admin = (os.environ.get("LINE_DEMO_ADMIN_TOKEN") or os.environ.get("LINE_STORES_ADMIN_TOKEN") or "").strip()
+    got = (request.headers.get("X-Admin-Token") or "").strip()
+    if admin and got and len(got) == len(admin) and hmac.compare_digest(got, admin):
+        return None
+    remote = (request.remote_addr or "").strip()
+    proxied = any(request.headers.get(h) for h in _PROXY_HEADERS)
+    if remote in _LOOPBACK and not proxied:
+        return None
+    LOG.warning("demo endpoint denied remote=%s proxied=%s", remote, proxied)
+    return jsonify({"ok": False, "error": "forbidden (local only or X-Admin-Token)"}), 403
+
+
 @app.post("/demo/message")
 def demo_message():
     """資格情報なしのローカル確認用。
@@ -2092,6 +2119,9 @@ def demo_message():
     JSON: {"text":"登録 DEMO01","userId":"Udemo"}
          {"postback":"v=1&action=manager_menu","userId":"Udemo"}
     """
+    denied = _demo_access_denied()
+    if denied is not None:
+        return denied
     data = request.get_json(silent=True) or {}
     user_id = data.get("userId") or "Udemo"
     postback = data.get("postback")
