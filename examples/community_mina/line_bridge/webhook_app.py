@@ -150,7 +150,13 @@ from invite_share import (  # noqa: E402
     invite_qr_png,
     valid_code,
 )
-from line_ui import ONBOARDING_ACTIONS  # noqa: E402
+from line_ui import ONBOARDING_ACTIONS, PHASE2_ACTIONS  # noqa: E402
+import attendance as att  # noqa: E402
+import phase2_ui as p2ui  # noqa: E402
+import quantum_compare as qc  # noqa: E402
+import shift_rules as sr  # noqa: E402
+import slot_optimizer as so  # noqa: E402
+from stores import update_store  # noqa: E402
 
 from payroll import (  # noqa: E402
     build_staff_forecast,
@@ -528,6 +534,362 @@ def _onboarding_action(user_id: str, kind: str, intent: dict[str, Any]) -> list[
     return _decorate_menu(user_id, [_text("不明な操作です。「続きから」または「メニュー」を送ってください。")])
 
 
+# ---- シフト希望・条件付き自動作成・量子比較・勤怠 --------------------------------
+
+QCOMPARE_SYNC_SECONDS = float(os.environ.get("QCOMPARE_SYNC_SECONDS", "8"))
+QCOMPARE_JOBS: dict[str, Any] = {}
+
+
+def _member_store(user_id: str) -> tuple[dict[str, Any] | None, str | None, list[dict[str, Any]] | None]:
+    store = get_store_for_user(user_id)
+    if store is None:
+        return None, None, _decorate_menu(user_id, [_text(need_register_text())])
+    wid = att.member_wid(store, user_id)
+    if not wid:
+        return None, None, [_text("あなたの枠がありません。")]
+    return store, wid, None
+
+
+def _rules_gate(user_id: str) -> tuple[dict[str, Any] | None, list[dict[str, Any]] | None]:
+    store, err = _manager_gate(user_id)
+    return store, err
+
+
+def _save_availability(user_id: str, entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    store, wid, err = _member_store(user_id)
+    if err:
+        return err
+    assert store and wid
+    saved = update_store(store["store_id"], lambda s: sr.set_availability(s, wid, entries)) or store
+    lines = [f"{sr.date_label(e['date'])}: {sr.entry_text(sr.availability_for(saved, wid, e['date']) or e)}" for e in entries]
+    body = "シフト希望を保存しました。\n" + "\n".join(lines)
+    return [with_quick_reply(_text(body), p2ui.after_avail_items())]
+
+
+def _rule_plans(user_id: str) -> list[dict[str, Any]]:
+    store, err = _rules_gate(user_id)
+    if err:
+        return err
+    assert store is not None
+    gate = _feature_gate(store, "make_three_plans")
+    if gate:
+        return _decorate_menu(user_id, gate)
+    if len(sr.worker_ids(store)) < 2:
+        return [with_quick_reply(_text("条件付き自動作成にはスタッフが2名以上必要です。先にスタッフを招待するか、サンプルで試してください。"),
+                                 [qr_postback_item("スタッフを招待", "show_invite"), qr_postback_item("サンプルで試す", "sample_plans")])]
+    bundle = so.generate_rule_plans(store)
+    update_store(store["store_id"], lambda s: s.__setitem__("pending_rule_plans", bundle))
+    mark_onboarding(store["store_id"], "first_plan")
+    body = so.format_rule_plans_text(store, bundle)
+    if len(body) > 4800:
+        body = body[:4700] + "\n…(省略)"
+    flex = so.build_rule_plans_flex(bundle, qcompare_enabled=True)
+    return [_text(body), with_quick_reply(flex, p2ui.plans_quick_items())]
+
+
+def _confirm_rule_plan(user_id: str, key: str) -> list[dict[str, Any]]:
+    store, err = _rules_gate(user_id)
+    if err:
+        return err
+    assert store is not None
+    bundle = store.get("pending_rule_plans") or {}
+    plan = next((p for p in bundle.get("plans") or [] if p["key"] == key), None)
+    if not plan:
+        return [_text("確定できる条件案がありません。先に「条件でシフト作成」を押してください。")]
+    dated = so.dated_shifts_from_plan(bundle, plan)
+
+    def _apply(s: dict[str, Any]) -> None:
+        s.setdefault("dated_shifts", {}).update(dated)
+        s["confirmed_rule_plan"] = {"key": plan["key"], "label": plan["label"], "dates": bundle["dates"],
+                                    "metrics": plan["metrics"], "confirmed_by": user_id,
+                                    "confirmed_at": sr.now_jst().isoformat(timespec="seconds")}
+
+    store = update_store(store["store_id"], _apply) or store
+    m = plan["metrics"]
+    lines = so.schedule_lines(store, bundle, plan)
+    notice = (f"【シフト確定のお知らせ】「{store['store_name']}」{sr.date_label(bundle['dates'][0])}〜{sr.date_label(bundle['dates'][-1])}\n"
+              + "\n".join(lines) + "\n「自分のシフト」で自分の分だけ確認できます。出勤・退勤はボタンで記録してください。")
+    bc = broadcast_to_store(store, messages=[_text(notice[:4900])])
+    reply = (f"【{plan['label']}】で確定しました。\n人件費 {m['labor_cost']:,}円 ／ 制約違反 {m['violation_total']}件\n"
+             f"給与見込みは確定シフトの日付・時間から自動計算されます（「給与 今月」）。\n通知: {bc.get('detail')}")
+    return _decorate_menu(user_id, [_text(reply)])
+
+
+def _qcompare_store_result(store_id: str, res: dict[str, Any]) -> None:
+    update_store(store_id, lambda s: s.__setitem__("last_qcompare", res))
+
+
+def _qcompare_messages(res: dict[str, Any]) -> list[dict[str, Any]]:
+    if not res.get("ok"):
+        return [_text(res.get("error") or "比較できませんでした。")]
+    return [with_quick_reply(qc.build_panel_flex(res), p2ui.qcompare_items())]
+
+
+def _qcompare(user_id: str, key: str | None) -> list[dict[str, Any]]:
+    store, err = _rules_gate(user_id)
+    if err:
+        return err
+    assert store is not None
+    if not has_feature(store, "qaoa_compare"):
+        return _decorate_menu(user_id, [_text(upgrade_message("qaoa_compare", store))])
+    pending = store.get("pending_rule_plans")
+    if not pending:
+        return [_text("先に「条件でシフト作成」で案を作ってください。")]
+    import threading
+
+    sid = store["store_id"]
+    box: dict[str, Any] = {}
+
+    def _job() -> None:
+        try:
+            res = qc.run_compare(store, key or "balance", pending)
+        except Exception as exc:  # noqa: BLE001
+            LOG.exception("qcompare failed")
+            res = {"ok": False, "error": f"比較の実行に失敗しました: {exc}"}
+        if res.get("ok"):
+            _qcompare_store_result(sid, res)
+        box["res"] = res
+        if box.get("async"):
+            push_messages(user_id, messages=_qcompare_messages(res))
+
+    th = threading.Thread(target=_job, daemon=True)
+    th.start()
+    th.join(QCOMPARE_SYNC_SECONDS)
+    if "res" in box:
+        return _qcompare_messages(box["res"])
+    box["async"] = True
+    QCOMPARE_JOBS[sid] = th
+    return [_text("⚛️ 量子方式のシミュレーションを計算中です。終わり次第このトークにお送りします。")]
+
+
+def _parse_md(token: str | None) -> str | None:
+    if not token:
+        return sr.now_jst().date().isoformat()
+    import re as _re
+    m = _re.match(r"^(\d{1,2})[/月](\d{1,2})日?$", token.strip())
+    if not m:
+        return None
+    d = sr._resolve_date(int(m.group(1)), int(m.group(2)), sr.now_jst().date())
+    return d.isoformat() if d else None
+
+
+def _clock(user_id: str, kind: str) -> list[dict[str, Any]]:
+    store, wid, err = _member_store(user_id)
+    if err:
+        return err
+    assert store
+    box: dict[str, Any] = {}
+
+    def _apply(s: dict[str, Any]) -> None:
+        att.sweep_absences(s)
+        box["r"] = att.clock_in(s, user_id) if kind == "in" else att.clock_out(s, user_id)
+
+    update_store(store["store_id"], _apply)
+    ok, msg = box.get("r") or (False, "記録できませんでした。")
+    return [with_quick_reply(_text(msg), p2ui.attendance_items(manager=is_user_manager(store, user_id)))]
+
+
+def _att_today(user_id: str, d: str | None = None) -> list[dict[str, Any]]:
+    store, err = _manager_gate(user_id)
+    if err:
+        return err
+    assert store is not None
+    store = update_store(store["store_id"], lambda s: att.sweep_absences(s)) or store
+    day = d or sr.now_jst().date().isoformat()
+    body = att.format_day_text(store, day) + "\n\n欠勤の登録: 「欠勤 太郎 10/5」／取消: 「欠勤取消 太郎 10/5」"
+    return [with_quick_reply(_text(body), p2ui.attendance_items(manager=True))]
+
+
+def _att_mine(user_id: str) -> list[dict[str, Any]]:
+    store, wid, err = _member_store(user_id)
+    if err:
+        return err
+    assert store and wid
+    store = update_store(store["store_id"], lambda s: att.sweep_absences(s)) or store
+    now = sr.now_jst()
+    return [with_quick_reply(_text(att.format_own_month_text(store, wid, now.year, now.month)),
+                             p2ui.attendance_items(manager=is_user_manager(store, user_id)))]
+
+
+def _phase2_action(user_id: str, kind: str, params: dict[str, str]) -> list[dict[str, Any]]:
+    if kind == "avail_menu":
+        store, wid, err = _member_store(user_id)
+        return err or p2ui.avail_picker_messages(sr.planning_dates(store))
+    if kind == "avail_pick":
+        store, wid, err = _member_store(user_id)
+        if err:
+            return err
+        d = (params.get("date") or "").strip()
+        try:
+            date_ok = bool(d) and bool(__import__("datetime").date.fromisoformat(d))
+        except ValueError:
+            date_ok = False
+        if not date_ok:
+            return p2ui.avail_picker_messages(sr.planning_dates(store))
+        return p2ui.avail_options_messages(store, d)
+    if kind == "avail_set":
+        store, wid, err = _member_store(user_id)
+        if err:
+            return err
+        d = params.get("date") or ""
+        st = params.get("st")
+        try:
+            __import__("datetime").date.fromisoformat(d)
+        except ValueError:
+            return [_text("日付が不正です。")]
+        if st == "ng":
+            e = {"date": d, "status": "ng", "start": None, "end": None}
+        else:
+            slot = next((s for s in sr.get_rules(store)["slots"] if s["name"] == params.get("slot")), None)
+            e = {"date": d, "status": "ok", "start": slot["start"] if slot else None, "end": slot["end"] if slot else None}
+        return _save_availability(user_id, [e])
+    if kind == "avail_done":
+        store, wid, err = _member_store(user_id)
+        if err:
+            return err
+        dates = sr.planning_dates(store)
+        update_store(store["store_id"], lambda s: sr.mark_done(s, wid, dates[0]))
+        return _decorate_menu(user_id, [_text(f"{sr.date_label(dates[0])}〜{sr.date_label(dates[-1])} のシフト希望を提出しました。ありがとうございます！\n"
+                                              "※ 記入していない日は「入れない」扱いになります。")])
+    if kind == "avail_mine":
+        store, wid, err = _member_store(user_id)
+        if err:
+            return err
+        return [with_quick_reply(_text(sr.own_availability_text(store, wid, sr.planning_dates(store))), p2ui.after_avail_items())]
+    if kind == "avail_tally":
+        store, err = _manager_gate(user_id)
+        if err:
+            return err
+        t = sr.tally(store, sr.planning_dates(store))
+        return p2ui.tally_messages(sr.format_tally_text(store, t), has_missing=bool(t["missing"]))
+    if kind == "avail_remind":
+        store, err = _manager_gate(user_id)
+        if err:
+            return err
+        dates = sr.planning_dates(store)
+        t = sr.tally(store, dates)
+        uids = [m["user_id"] for m in store.get("members") or [] if str(m.get("worker_id")) in t["missing"] and m.get("user_id") != user_id]
+        msg = [with_quick_reply(_text(f"【{store['store_name']}】{sr.date_label(dates[0])}〜{sr.date_label(dates[-1])} のシフト希望をお願いします。"),
+                                [qr_postback_item("シフト希望を出す", "avail_menu")])]
+        sent = [push_messages(u, messages=msg) for u in uids]
+        return [_text(f"未提出 {len(uids)} 名にリマインドを送りました（{'実送信' if any(r.get('sent') for r in sent) else 'デモ／未送信'}）。")]
+    if kind == "rule_show":
+        store, err = _manager_gate(user_id)
+        return err or p2ui.rules_messages(store)  # type: ignore[arg-type]
+    if kind in {"rule_req", "rule_mix", "rule_consec"}:
+        store, err = _manager_gate(user_id)
+        if err:
+            return err
+        assert store is not None
+        if kind == "rule_req":
+            cur = next((s for s in sr.get_rules(store)["slots"] if s["name"] == params.get("slot")), None)
+            if not cur:
+                return [_text("枠が見つかりません。")]
+            n = max(0, min(20, int(cur["required"]) + (1 if params.get("d") == "1" else -1)))
+            intent = {"intent": "rule_required", "pairs": [(cur["name"], n)]}
+        elif kind == "rule_mix":
+            intent = {"intent": "rule_mix", "on": params.get("on") == "1"}
+        else:
+            intent = {"intent": "rule_max_consecutive", "days": int(params.get("n") or 5)}
+        return _apply_rule(user_id, store, intent)
+    if kind == "rule_plans":
+        return _rule_plans(user_id)
+    if kind == "confirm_rule_plan":
+        return _confirm_rule_plan(user_id, params.get("key") or "")
+    if kind == "qcompare":
+        return _qcompare(user_id, params.get("key"))
+    if kind == "qcompare_detail":
+        store, err = _manager_gate(user_id)
+        if err:
+            return err
+        res = (store or {}).get("last_qcompare")
+        if not res:
+            return [_text("まだ比較結果がありません。案の「⚛️ 量子で比べる」を押してください。")]
+        return [_text(qc.detail_text(res))]
+    if kind == "clock_in":
+        return _clock(user_id, "in")
+    if kind == "clock_out":
+        return _clock(user_id, "out")
+    if kind == "att_today":
+        return _att_today(user_id)
+    if kind == "att_mine":
+        return _att_mine(user_id)
+    return [_text("不明な操作です。")]
+
+
+def _apply_rule(user_id: str, store: dict[str, Any], intent: dict[str, Any]) -> list[dict[str, Any]]:
+    box: dict[str, Any] = {}
+
+    def _fn(s: dict[str, Any]) -> None:
+        box["r"] = sr.apply_rule_intent(s, intent)
+
+    store = update_store(store["store_id"], _fn) or store
+    ok, note = box["r"]
+    msgs = p2ui.rules_messages(store)
+    msgs[0] = with_quick_reply(_text(note + "\n\n" + msgs[0]["text"]), msgs[0]["quickReply"]["items"])
+    return msgs
+
+
+def _phase2_text(user_id: str, text: str) -> list[dict[str, Any]] | None:
+    t = (text or "").strip().replace("\u3000", " ")
+    exact = {
+        "出勤": ("clock_in", {}), "退勤": ("clock_out", {}),
+        "シフト希望": ("avail_menu", {}), "シフト希望を出す": ("avail_menu", {}),
+        "自分の希望": ("avail_mine", {}), "提出完了": ("avail_done", {}),
+        "未提出者にリマインド": ("avail_remind", {}),
+        "今日の勤怠": ("att_today", {}), "自分の勤怠": ("att_mine", {}),
+        "量子で比べる": ("qcompare", {"key": "balance"}), "⚛️ 量子で比べる": ("qcompare", {"key": "balance"}),
+        "量子比較の詳細": ("qcompare_detail", {}),
+    }
+    if t in exact:
+        k, prm = exact[t]
+        return _phase2_action(user_id, k, prm)
+    if t == "勤怠":
+        store = get_store_for_user(user_id)
+        if store and is_user_manager(store, user_id):
+            return _att_today(user_id)
+        return _att_mine(user_id)
+    import re as _re
+    m = _re.match(r"^勤怠\s+(\S+)$", t)
+    if m:
+        d = _parse_md(m.group(1))
+        return _att_today(user_id, d) if d else [_text("日付は「勤怠 10/5」の形式で指定してください。")]
+    m = _re.match(r"^(欠勤取消|欠勤)\s+(\S+?)(?:\s+(\S+))?$", t)
+    if m:
+        store, err = _manager_gate(user_id)
+        if err:
+            return err
+        assert store is not None
+        wid = sr.resolve_name(store, m.group(2))
+        d = _parse_md(m.group(3))
+        if not wid or not d:
+            return [_text("例: 「欠勤 太郎 10/5」（日付省略で今日）")]
+        box: dict[str, Any] = {}
+        update_store(store["store_id"], lambda s: box.__setitem__("r", att.mark_absent(s, wid, d, undo=m.group(1) == "欠勤取消")))
+        return [with_quick_reply(_text(box["r"][1]), p2ui.attendance_items(manager=True))]
+    m = _re.match(r"^確定\s*条件案\s*(\S+)$", t) or _re.match(r"^条件案\s*(\S+?)\s*で確定$", t)
+    if m:
+        key = {"希望優先": "prefer", "人件費優先": "cost", "バランス": "balance", "1": "prefer", "2": "cost", "3": "balance"}.get(m.group(1), m.group(1))
+        return _confirm_rule_plan(user_id, key)
+    rule = sr.parse_rule_text(t)
+    if rule is not None:
+        kind = rule["intent"]
+        if kind == "rule_show":
+            return _phase2_action(user_id, "rule_show", {})
+        if kind == "rule_plans":
+            return _rule_plans(user_id)
+        if kind == "avail_tally":
+            return _phase2_action(user_id, "avail_tally", {})
+        store, err = _manager_gate(user_id)
+        if err:
+            return err
+        return _apply_rule(user_id, store, rule)  # type: ignore[arg-type]
+    entries = sr.parse_availability_text(t)
+    if entries is not None:
+        return _save_availability(user_id, entries)
+    return None
+
+
 def handle_postback_message(user_id: str, data: str) -> list[dict[str, Any]]:
     """postback data → messages (reuses text intent dispatch)."""
     intent = postback_to_intent(data)
@@ -540,6 +902,8 @@ def handle_postback_message(user_id: str, data: str) -> list[dict[str, Any]]:
     kind = intent.get("intent")
     if kind in ONBOARDING_ACTIONS:
         return _onboarding_action(user_id, kind, intent)
+    if kind in PHASE2_ACTIONS:
+        return _phase2_action(user_id, kind, intent.get("params") or {})
     # set_pref_incomplete from prompt_pref → day picker
     if kind == "set_pref_incomplete" and intent.get("via") == "postback":
         return pref_picker_messages()
@@ -599,6 +963,9 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
         handled = _handle_pending_input(user_id, text, state)
         if handled is not None:
             return handled
+    p2 = _phase2_text(user_id, text)
+    if p2 is not None:
+        return p2
     intent = parse_user_intent(text)
     kind = intent.get("intent")
 
@@ -1586,6 +1953,9 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
         else:
             note_src = "（確定シフト）"
         dn = (member or {}).get("display_name") or wid
+        dated_txt = so.own_dated_shift_text(store, wid) if store else None
+        if dated_txt:
+            return _decorate_menu(user_id, [_text(dated_txt)])
         body = format_own_shift_text(schedule, sc, wid, display_name=dn) + f"\n{note_src}"
         return _decorate_menu(user_id, [{"type": "text", "text": body}])
 
@@ -1650,6 +2020,9 @@ def process_event(event: dict[str, Any]) -> dict[str, Any] | None:
 
     if etype == "postback":
         data = ((event.get("postback") or {}).get("data")) or ""
+        params = (event.get("postback") or {}).get("params") or {}
+        if params.get("date") and "date=" not in data:
+            data = f"{data}&date={params['date']}"
         LOG.info("postback from %s: %s", user_id, data[:200])
         messages = handle_postback_message(user_id, data)
         return reply_messages(reply_token, messages)
@@ -2127,6 +2500,9 @@ def demo_message():
     postback = data.get("postback")
     text = data.get("text")
     if postback:
+        pparams = data.get("params") or {}
+        if isinstance(pparams, dict) and pparams.get("date") and "date=" not in postback:
+            postback = f"{postback}&date={pparams['date']}"
         messages = handle_postback_message(user_id, postback or "")
     else:
         text = text or "シフト見せて"

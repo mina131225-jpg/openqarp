@@ -1234,3 +1234,16 @@ def manager_user_ids(store: dict[str, Any] | None) -> list[str]:
         for m in (store or {}).get("members") or []
         if m.get("is_manager") and m.get("user_id")
     ]
+
+
+def update_store(store_id: str, fn) -> dict[str, Any] | None:
+    """店舗レコードをロック下で更新するための汎用ヘルパ。fn(store) の戻り値は無視。"""
+    with _LOCK:
+        db = _load_unlocked()
+        store = db["stores"].get(store_id)
+        if not store:
+            return None
+        fn(store)
+        store["updated_at"] = _now_iso()
+        _save_unlocked(db)
+        return deepcopy(store)

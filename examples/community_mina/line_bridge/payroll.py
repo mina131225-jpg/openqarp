@@ -402,6 +402,45 @@ def planned_hours_from_schedule(
     }
 
 
+def planned_hours_from_dated_shifts(
+    store: dict[str, Any] | None, worker_id: str, *, year: int, month: int
+) -> dict[str, float] | None:
+    """条件付き自動作成で確定した日付シフト（store["dated_shifts"]）から、その月の予定を積算。
+
+    深夜は 22:00〜翌5:00 の重なり、残業は週（ISO週）40時間超。該当月に日付シフトが無ければ None。
+    """
+    ds = (store or {}).get("dated_shifts") or {}
+    prefix = f"{year:04d}-{month:02d}-"
+    days = sorted(d for d in ds if d.startswith(prefix))
+    if not days:
+        return None
+    from datetime import date as _date
+    from shift_rules import hm_to_min, night_hours
+
+    hours = night = 0.0
+    work_days = 0
+    week: dict[tuple[int, int], float] = {}
+    for d in days:
+        mine = [x for x in ds[d].get("slots") or [] if worker_id in (x.get("workers") or [])]
+        if not mine:
+            continue
+        work_days += 1
+        for x in mine:
+            h = (hm_to_min(x["end"]) - hm_to_min(x["start"])) / 60.0
+            hours += h
+            night += night_hours(x["start"], x["end"])
+            wk = _date.fromisoformat(d).isocalendar()[:2]
+            week[wk] = week.get(wk, 0.0) + h
+    ot = sum(max(0.0, h - STATUTORY_WEEKLY_HOURS) for h in week.values())
+    return {
+        "hours": round(hours, 2),
+        "work_days": work_days,
+        "night_hours": round(night, 2),
+        "ot_hours": round(ot, 2),
+        "dated_days": len(days),
+    }
+
+
 def _confirmed_schedule(store: dict[str, Any] | None) -> dict[str, list[bool]] | None:
     if not store:
         return None
@@ -435,6 +474,11 @@ def build_staff_forecast(
     scale = DEFAULT_WEEKS_PER_MONTH if scale_weeks is None else float(scale_weeks)
     schedule = _confirmed_schedule(store)
     planned = planned_hours_from_schedule(schedule, scenario, store, worker_id, scale_weeks=scale)
+    planned_basis = "weekly_x_month" if schedule is not None else "slot_estimate"
+    dated = planned_hours_from_dated_shifts(store, worker_id, year=year, month=month)
+    if dated is not None:
+        planned = dated
+        planned_basis = "dated_shifts"
     override = _get_actual_override(store, year, month, worker_id)
     if override:
         hours = float(override.get("actual_hours", planned["hours"]))
@@ -479,7 +523,10 @@ def build_staff_forecast(
         "month": month,
         "month_key": _month_key(year, month),
         "source": source,
-        "has_confirmed_shift": schedule is not None,
+        "actual_source": (override or {}).get("source") if override else None,
+        "actual_meta": {k: (override or {}).get(k) for k in ("clock_days", "late_count", "early_count", "absent_count")} if override else None,
+        "planned_basis": planned_basis,
+        "has_confirmed_shift": schedule is not None or dated is not None,
         "scale_weeks": scale,
         "planned": {
             "hours": planned["hours"],
@@ -549,8 +596,27 @@ def month_forecast(store: dict[str, Any], scenario: dict[str, Any], *, year: int
         "locked_record": locked_rec,
         "method": METHOD_LABEL,
         "method_note": METHOD_NOTE,
-        "has_confirmed_shift": _confirmed_schedule(store) is not None,
+        "has_confirmed_shift": _confirmed_schedule(store) is not None or any(
+            str(d).startswith(f"{year:04d}-{month:02d}-") for d in (store.get("dated_shifts") or {})
+        ),
     }
+
+
+def _source_label(row: dict[str, Any], *, short: bool = False) -> str:
+    if row.get("source") == "actual":
+        meta = row.get("actual_meta") or {}
+        if row.get("actual_source") == "clock":
+            if short:
+                return f"実績・打刻{meta.get('clock_days') or 0}日"
+            return (f"実績ベース（出勤・退勤の打刻 {meta.get('clock_days') or 0}日分／"
+                    f"遅刻{meta.get('late_count') or 0}・早退{meta.get('early_count') or 0}・欠勤{meta.get('absent_count') or 0}）")
+        return "実績" if short else "実績ベース（手入力）"
+    basis = row.get("planned_basis")
+    if basis == "dated_shifts":
+        return "見込み・確定シフト" if short else "見込み（確定シフトの日付・時間から自動計算）"
+    if basis == "weekly_x_month":
+        return "予定" if short else "予定ベース（確定シフト×月換算）"
+    return "予定" if short else "予定ベース（未確定のため枠ごとの試算）"
 
 
 def format_month_payroll_text(forecast: dict[str, Any], *, store_name: str | None = None) -> str:
@@ -580,7 +646,7 @@ def format_month_payroll_text(forecast: dict[str, Any], *, store_name: str | Non
     lines.append("■ スタッフ別")
     for r in forecast.get("staff") or []:
         pay = r["current"]
-        src = "実績" if r["source"] == "actual" else "予定"
+        src = _source_label(r, short=True)
         lines.append(
             f"  {r['display_name']}: {pay['hours']:g}h / "
             f"基本{pay['base_pay']:,} + 深夜{pay['night_pay']:,} + 残業{pay['ot_pay']:,} + "
@@ -595,7 +661,7 @@ def format_month_payroll_text(forecast: dict[str, Any], *, store_name: str | Non
 def format_staff_payroll_text(row: dict[str, Any], *, store_name: str | None = None) -> str:
     pay = row["current"]
     rates = row["rates"]
-    src = "実績ベース" if row["source"] == "actual" else "予定ベース（確定シフト×月換算）"
+    src = _source_label(row)
     title = f"{row['display_name']} の給与見込み（{month_label(row['year'], row['month'])}）"
     if store_name:
         title = f"「{store_name}」{title}"
@@ -613,6 +679,9 @@ def format_staff_payroll_text(row: dict[str, Any], *, store_name: str | None = N
     for a in pay.get("allowance_rows") or []:
         lines.append(f"  ・{a['name']}（{a['type']}）: {a['subtotal']:,}円")
     lines.append(f"合計予定給与: {pay['total']:,}円")
+    if row["source"] == "actual":
+        pp = (row.get("planned") or {}).get("pay") or {}
+        lines.append(f"（参考）確定シフトからの見込み: {int(pp.get('total') or 0):,}円 / {float((row.get('planned') or {}).get('hours') or 0):g}h")
     lines.append(f"計算式: {pay['formula']}")
     lines.append(f"※ {METHOD_NOTE}")
     return "\n".join(lines)
@@ -808,6 +877,7 @@ def set_actual_hours(
         if work_days is not None:
             row["work_days"] = int(max(0, work_days))
         row["updated_at"] = _now_iso()
+        row["source"] = "manual"  # 手入力は打刻集計で上書きしない
         month_map[wid] = row
         store["updated_at"] = _now_iso()
         _save_unlocked(db)

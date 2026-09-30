@@ -24,6 +24,14 @@ ONBOARDING_ACTIONS = frozenset({
     "cancel_input",
 })
 
+# シフト希望・条件付き自動作成・量子比較・勤怠（webhook_app._phase2_action で処理）
+PHASE2_ACTIONS = frozenset({
+    "avail_menu", "avail_pick", "avail_set", "avail_done", "avail_mine", "avail_tally", "avail_remind",
+    "rule_show", "rule_req", "rule_mix", "rule_consec", "rule_plans", "confirm_rule_plan",
+    "qcompare", "qcompare_detail",
+    "clock_in", "clock_out", "att_today", "att_mine",
+})
+
 # ---- postback codec (data <= 300 bytes) ------------------------------------
 
 def encode_postback(**params: str) -> str:
@@ -116,6 +124,8 @@ def postback_to_intent(data: str) -> dict[str, Any] | None:
         return {"intent": "legal_links", "raw": data, "via": "postback"}
     if action in ONBOARDING_ACTIONS:
         return {"intent": action, "raw": data, "via": "postback"}
+    if action in PHASE2_ACTIONS:
+        return {"intent": action, "raw": data, "via": "postback", "params": p}
     return None
 
 
@@ -215,11 +225,18 @@ def manager_menu_items() -> list[dict[str, Any]]:
         qr_postback("今月の状況", encode_postback(action="month_status"), display_text="今月の状況"),
         qr_postback("料金プラン", encode_postback(action="show_plans"), display_text="料金プラン"),
         qr_postback("スタッフ招待", encode_postback(action="show_invite"), display_text="スタッフを招待"),
+        qr_postback("条件設定", encode_postback(action="rule_show"), display_text="条件設定"),
+        qr_postback("提出状況", encode_postback(action="avail_tally"), display_text="提出状況"),
+        qr_postback("条件で自動作成", encode_postback(action="rule_plans"), display_text="条件でシフト作成"),
+        qr_postback("勤怠", encode_postback(action="att_today"), display_text="今日の勤怠"),
     ]
 
 
 def staff_menu_items() -> list[dict[str, Any]]:
     return [
+        qr_postback("出勤", encode_postback(action="clock_in"), display_text="出勤"),
+        qr_postback("退勤", encode_postback(action="clock_out"), display_text="退勤"),
+        qr_postback("シフト希望を出す", encode_postback(action="avail_menu"), display_text="シフト希望を出す"),
         qr_postback("自分のシフト", encode_postback(action="show_own_shift"), display_text="自分のシフト"),
         qr_postback("希望休", encode_postback(action="prompt_pref"), display_text="希望休"),
         qr_postback("シフト表", encode_postback(action="show_shift"), display_text="シフト見せて"),
@@ -289,6 +306,10 @@ def build_manager_menu_flex(*, store_name: str | None = None) -> dict[str, Any]:
         flex_button_postback("人件費・給与", encode_postback(action="payroll_menu"), style="secondary", display_text="人件費・給与"),
         flex_button_postback("今月の状況", encode_postback(action="month_status"), style="secondary", display_text="今月の状況"),
         flex_button_postback("料金プラン", encode_postback(action="show_plans"), style="primary", display_text="料金プラン"),
+        flex_button_postback("条件設定", encode_postback(action="rule_show"), style="secondary", display_text="条件設定"),
+        flex_button_postback("シフト希望の提出状況", encode_postback(action="avail_tally"), style="secondary", display_text="提出状況"),
+        flex_button_postback("条件でシフト自動作成", encode_postback(action="rule_plans"), style="primary", display_text="条件でシフト作成"),
+        flex_button_postback("今日の勤怠", encode_postback(action="att_today"), style="secondary", display_text="今日の勤怠"),
         flex_button_postback("スタッフを招待", encode_postback(action="show_invite"), style="secondary", display_text="スタッフを招待"),
         flex_button_postback("他の店長に紹介", encode_postback(action="refer_service"), style="secondary", display_text="他の店長に紹介"),
     ]
@@ -337,6 +358,9 @@ def build_staff_menu_flex(*, store_name: str | None = None) -> dict[str, Any]:
     if store_name:
         title = f"スタッフメニュー｜{store_name}"
     buttons = [
+        flex_button_postback("出勤", encode_postback(action="clock_in"), style="primary", display_text="出勤"),
+        flex_button_postback("退勤", encode_postback(action="clock_out"), style="primary", display_text="退勤"),
+        flex_button_postback("シフト希望を出す", encode_postback(action="avail_menu"), style="secondary", display_text="シフト希望を出す"),
         flex_button_postback("自分のシフト", encode_postback(action="show_own_shift"), style="primary", display_text="自分のシフト"),
         flex_button_postback("希望休を選ぶ", encode_postback(action="prompt_pref"), style="secondary", display_text="希望休"),
         flex_button_postback("シフト表を見る", encode_postback(action="show_shift"), style="secondary", display_text="シフト見せて"),
