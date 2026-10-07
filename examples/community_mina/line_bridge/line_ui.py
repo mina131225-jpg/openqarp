@@ -30,6 +30,7 @@ PHASE2_ACTIONS = frozenset({
     "rule_show", "rule_req", "rule_mix", "rule_consec", "rule_plans", "confirm_rule_plan",
     "qcompare", "qcompare_detail",
     "clock_in", "clock_out", "att_today", "att_mine",
+    "one_tap_month", "one_tap_wait", "one_tap_force", "one_tap_show3", "one_tap_preview",
 })
 
 # ---- postback codec (data <= 300 bytes) ------------------------------------
@@ -220,6 +221,7 @@ def manager_menu_items() -> list[dict[str, Any]]:
     return [
         qr_postback("店舗設定", encode_postback(action="store_settings"), display_text="店舗設定"),
         qr_postback("スタッフ管理", encode_postback(action="staff_mgmt"), display_text="スタッフ管理"),
+        qr_postback("来月のシフトを作る", encode_postback(action="one_tap_month"), display_text="来月のシフトを作る"),
         qr_postback("シフト作成", encode_postback(action="make_three_plans"), display_text="シフト作成"),
         qr_postback("人件費・給与", encode_postback(action="payroll_menu"), display_text="人件費・給与"),
         qr_postback("ダッシュボード", encode_postback(action="month_status"), display_text="ダッシュボード"),
@@ -302,7 +304,8 @@ def build_manager_menu_flex(*, store_name: str | None = None) -> dict[str, Any]:
     buttons = [
         flex_button_postback("店舗設定", encode_postback(action="store_settings"), style="secondary", display_text="店舗設定"),
         flex_button_postback("スタッフ管理", encode_postback(action="staff_mgmt"), style="secondary", display_text="スタッフ管理"),
-        flex_button_postback("シフト作成", encode_postback(action="make_three_plans"), style="primary", display_text="シフト作成"),
+        flex_button_postback("来月のシフトを作る", encode_postback(action="one_tap_month"), style="primary", display_text="来月のシフトを作る"),
+        flex_button_postback("シフト作成", encode_postback(action="make_three_plans"), style="secondary", display_text="シフト作成"),
         flex_button_postback("人件費・給与", encode_postback(action="payroll_menu"), style="secondary", display_text="人件費・給与"),
         flex_button_postback("ダッシュボード", encode_postback(action="month_status"), style="secondary", display_text="ダッシュボード"),
         flex_button_postback("料金プラン", encode_postback(action="show_plans"), style="primary", display_text="料金プラン"),

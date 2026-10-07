@@ -160,6 +160,7 @@ import quantum_compare as qc  # noqa: E402
 import shift_rules as sr  # noqa: E402
 import command_help as cmdhelp  # noqa: E402
 import manager_dashboard as dash  # noqa: E402
+import one_tap_shift as ots  # noqa: E402
 import slot_optimizer as so  # noqa: E402
 from stores import update_store  # noqa: E402
 
@@ -600,24 +601,85 @@ def _confirm_rule_plan(user_id: str, key: str) -> list[dict[str, Any]]:
     bundle = store.get("pending_rule_plans") or {}
     plan = next((p for p in bundle.get("plans") or [] if p["key"] == key), None)
     if not plan:
-        return [_text("確定できる条件案がありません。先に「条件でシフト作成」を押してください。")]
+        return [_text("確定できる条件案がありません。先に「来月のシフトを作る」または「条件でシフト作成」を押してください。")]
     dated = so.dated_shifts_from_plan(bundle, plan)
+    plabel = bundle.get("period_label") or ots.period_label(bundle.get("dates") or [])
 
     def _apply(s: dict[str, Any]) -> None:
         s.setdefault("dated_shifts", {}).update(dated)
-        s["confirmed_rule_plan"] = {"key": plan["key"], "label": plan["label"], "dates": bundle["dates"],
-                                    "metrics": plan["metrics"], "confirmed_by": user_id,
-                                    "confirmed_at": sr.now_jst().isoformat(timespec="seconds")}
+        s["confirmed_rule_plan"] = {
+            "key": plan["key"], "label": plan["label"], "dates": bundle["dates"],
+            "metrics": plan["metrics"], "confirmed_by": user_id,
+            "confirmed_at": sr.now_jst().isoformat(timespec="seconds"),
+            "period_label": plabel, "one_tap": bool(bundle.get("one_tap")),
+        }
 
     store = update_store(store["store_id"], _apply) or store
-    m = plan["metrics"]
-    lines = so.schedule_lines(store, bundle, plan)
-    notice = (f"【シフト確定のお知らせ】「{store['store_name']}」{sr.date_label(bundle['dates'][0])}〜{sr.date_label(bundle['dates'][-1])}\n"
-              + "\n".join(lines) + "\n「自分のシフト」で自分の分だけ確認できます。出勤・退勤はボタンで記録してください。")
-    bc = broadcast_to_store(store, messages=[_text(notice[:4900])])
-    reply = (f"【{plan['label']}】で確定しました。\n人件費 {m['labor_cost']:,}円 ／ 制約違反 {m['violation_total']}件\n"
-             f"給与見込みは確定シフトの日付・時間から自動計算されます（「給与 今月」）。\n通知: {bc.get('detail')}")
-    return _decorate_menu(user_id, [_text(reply)])
+
+    def _push(uid: str, messages: list[dict[str, Any]]) -> dict[str, Any]:
+        return push_messages(uid, messages=messages)
+
+    note = ots.notify_staff_own_shifts(store, dated, period_label_s=plabel, push_fn=_push)
+    notify_detail = f"スタッフへの個別通知: {note['sent']}/{note['targets']}名"
+    card = ots.completion_card(
+        store, bundle, plan,
+        notify_detail=notify_detail,
+        elapsed_ms=(plan.get("seconds") or 0) * 1000,
+    )
+    from line_ui import encode_postback, qr_postback
+    qr = [
+        qr_postback("ダッシュボード", encode_postback(action="month_status"), display_text="ダッシュボード"),
+        qr_postback("メニュー", encode_postback(action="manager_menu"), display_text="メニュー"),
+    ]
+    tip = f"【{plan['label']}】で確定しました。スタッフに各自のシフトを通知しました。"
+    return [with_quick_reply(_text(tip), qr), with_quick_reply(card, qr)]
+
+
+def _one_tap_generate(user_id: str, *, treat_missing: bool, preview_days: int | None = None) -> list[dict[str, Any]]:
+    store, err = _rules_gate(user_id)
+    if err:
+        return err
+    assert store is not None
+    dates = sr.next_month_dates()
+    if preview_days is None and not has_feature(store, "three_plans"):
+        return ots.free_limit_messages()
+    if preview_days is not None:
+        dates = dates[:preview_days]
+    # フル月は iters を少し抑えて LINE 応答時間を確保
+    iters = 400 if len(dates) > 14 else 600
+    bundle = ots.generate_month_plans(
+        store, dates=dates, treat_missing_unavailable=treat_missing,
+        iters=iters, preview_days=preview_days,
+    )
+    update_store(store["store_id"], lambda s: s.__setitem__("pending_rule_plans", bundle))
+    mark_onboarding(store["store_id"], "first_plan")
+    qok = has_feature(store, "qaoa_compare")
+    return ots.best_plan_messages(store, bundle, qcompare=qok)
+
+
+def _one_tap_start(user_id: str, *, preview: bool = False) -> list[dict[str, Any]]:
+    store, err = _rules_gate(user_id)
+    if err:
+        return err
+    assert store is not None
+    if not preview and not has_feature(store, "three_plans"):
+        return ots.free_limit_messages()
+    if len(sr.worker_ids(store)) < 2:
+        return [with_quick_reply(
+            _text("来月のシフト作成にはスタッフが2名以上必要です。先にスタッフを招待してください。"),
+            [qr_postback_item("スタッフを招待", "show_invite")],
+        )]
+    dates = sr.next_month_dates()
+    if preview:
+        dates = dates[:7]
+    gate = ots.prefs_gate(store, dates)
+    if not gate["complete"]:
+        # プレビューでも未提出確認（短い期間）
+        update_store(store["store_id"], lambda s: s.__setitem__("one_tap_pending", {
+            "dates": dates, "preview": preview, "asked_at": sr.now_jst().isoformat(timespec="seconds"),
+        }))
+        return ots.incomplete_prefs_messages(store, gate)
+    return _one_tap_generate(user_id, treat_missing=False, preview_days=7 if preview else None)
 
 
 def _qcompare_store_result(store_id: str, res: dict[str, Any]) -> None:
@@ -797,6 +859,45 @@ def _phase2_action(user_id: str, kind: str, params: dict[str, str]) -> list[dict
         else:
             intent = {"intent": "rule_max_consecutive", "days": int(params.get("n") or 5)}
         return _apply_rule(user_id, store, intent)
+    if kind == "one_tap_month":
+        return _one_tap_start(user_id, preview=False)
+    if kind == "one_tap_preview":
+        return _one_tap_start(user_id, preview=True)
+    if kind == "one_tap_wait":
+        store, err = _manager_gate(user_id)
+        if err:
+            return err
+        assert store is not None
+        pending = store.get("one_tap_pending") or {}
+        dates = pending.get("dates") or sr.next_month_dates()
+        t = sr.tally(store, dates)
+        uids = [m["user_id"] for m in store.get("members") or []
+                if str(m.get("worker_id")) in t["missing"] and m.get("user_id") != user_id]
+        msg = [with_quick_reply(
+            _text(f"【{store['store_name']}】{ots.period_label(dates)} のシフト希望をお願いします（来月シフト作成のため）。"),
+            [qr_postback_item("シフト希望を出す", "avail_menu")],
+        )]
+        sent = [push_messages(u, messages=msg) for u in uids]
+        body = (f"未提出 {len(uids)} 名に催促しました"
+                f"（{'実送信' if any(r.get('sent') for r in sent) else 'デモ／未送信'}）。\n"
+                "希望が揃ったら、もう一度「来月のシフトを作る」を押してください。")
+        return _decorate_menu(user_id, [_text(body)])
+    if kind == "one_tap_force":
+        store = get_store_for_user(user_id)
+        pending = (store or {}).get("one_tap_pending") or {}
+        preview = bool(pending.get("preview"))
+        return _one_tap_generate(user_id, treat_missing=True, preview_days=7 if preview else None)
+    if kind == "one_tap_show3":
+        store, err = _rules_gate(user_id)
+        if err:
+            return err
+        assert store is not None
+        bundle = store.get("pending_rule_plans") or {}
+        if not bundle.get("plans"):
+            return [_text("表示する案がありません。先に「来月のシフトを作る」を押してください。")]
+        flex = so.build_rule_plans_flex(bundle, qcompare_enabled=has_feature(store, "qaoa_compare"))
+        tip = f"【3案】{bundle.get('period_label') or ''}\n気に入った案の「この案で確定」を押してください。"
+        return [_text(tip), with_quick_reply(flex, p2ui.plans_quick_items())]
     if kind == "rule_plans":
         return _rule_plans(user_id)
     if kind == "confirm_rule_plan":
@@ -1158,6 +1259,9 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
         _upd(store["store_id"], _refresh)
         store = get_store(store["store_id"]) or store
         return dash.dashboard_messages(store, sc)
+
+    if kind == "one_tap_month":
+        return _one_tap_start(user_id, preview=False)
 
     def _require_store() -> tuple[dict[str, Any] | None, list[dict[str, Any]] | None]:
         store = get_store_for_user(user_id)

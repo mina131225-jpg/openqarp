@@ -68,6 +68,18 @@ def date_label(d: str | date) -> str:
     return f"{dd.month}/{dd.day}({WEEKDAYS_JA[dd.weekday()]})"
 
 
+def next_month_dates(*, today: date | None = None) -> list[str]:
+    """翌カレンダー月の全日（YYYY-MM-DD）。"""
+    t = today or now_jst().date()
+    if t.month == 12:
+        y, m = t.year + 1, 1
+    else:
+        y, m = t.year, t.month + 1
+    import calendar as _cal
+    last = _cal.monthrange(y, m)[1]
+    return [date(y, m, d).isoformat() for d in range(1, last + 1)]
+
+
 def planning_dates(store: dict[str, Any] | None = None, *, today: date | None = None) -> list[str]:
     """次の計画期間（既定: 翌週月曜から7日）。"""
     rules = get_rules(store)

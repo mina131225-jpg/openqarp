@@ -173,6 +173,8 @@ def parse_user_intent(text: str) -> dict[str, Any]:
         return {"intent": "payroll_menu", "raw": raw}
     if re.fullmatch(r"今月の状況|今月の状態|ダッシュボード", normalized):
         return {"intent": "month_status", "raw": raw}
+    if re.fullmatch(r"来月のシフトを作る|来月シフト|来月のシフト|ワンタップシフト", normalized):
+        return {"intent": "one_tap_month", "raw": raw}
 
     # --- 料金プラン / 申し込み（外部チェックアウト。LINE IAP 定期は使わない） ---
     if re.fullmatch(r"プラン|料金プラン|料金|サブスク|サブスクリプション", normalized):

@@ -389,8 +389,11 @@ def build_dashboard_flex(data: dict[str, Any], store: dict[str, Any]) -> dict[st
         footer_btns.append(
             flex_button_postback("給与 今月", encode_postback(action="payroll_month", month="今月"), style="secondary", display_text="給与 今月")
         )
+    footer_btns.insert(0, flex_button_postback(
+        "来月のシフトを作る", encode_postback(action="one_tap_month"), style="primary", display_text="来月のシフトを作る"
+    ))
     footer_btns.append(
-        flex_button_postback("条件で自動作成", encode_postback(action="rule_plans"), style="primary", display_text="条件でシフト作成")
+        flex_button_postback("条件で自動作成", encode_postback(action="rule_plans"), style="secondary", display_text="条件でシフト作成")
     )
 
     title = f"店長ダッシュボード｜{data['store_name']}"
@@ -431,6 +434,7 @@ def dashboard_quick_items(*, full: bool = True) -> list[dict[str, Any]]:
         qr_postback("提出状況", encode_postback(action="avail_tally"), display_text="提出状況"),
         qr_postback("未提出リマインド", encode_postback(action="avail_remind"), display_text="未提出者にリマインド"),
         qr_postback("今日の勤怠", encode_postback(action="att_today"), display_text="今日の勤怠"),
+        qr_postback("来月のシフトを作る", encode_postback(action="one_tap_month"), display_text="来月のシフトを作る"),
         qr_postback("条件で自動作成", encode_postback(action="rule_plans"), display_text="条件でシフト作成"),
         qr_postback("メニュー", encode_postback(action="manager_menu"), display_text="メニュー"),
     ]
