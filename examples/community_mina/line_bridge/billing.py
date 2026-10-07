@@ -108,7 +108,7 @@ FEATURE_GATES: dict[str, str] = {
     "payroll_lock_confirm": "payroll",
     "payroll_csv": "csv_export",
     "payroll_menu": "payroll",
-    "month_status": "payroll",
+    # month_status: FREE=簡易ダッシュボード / STANDARD+ =フル（manager_dashboard 内で分岐）
     "set_budget": "payroll",
     "set_commute": "advanced_labor",
     "set_allowance": "advanced_labor",

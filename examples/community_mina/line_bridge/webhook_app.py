@@ -159,6 +159,7 @@ import phase2_ui as p2ui  # noqa: E402
 import quantum_compare as qc  # noqa: E402
 import shift_rules as sr  # noqa: E402
 import command_help as cmdhelp  # noqa: E402
+import manager_dashboard as dash  # noqa: E402
 import slot_optimizer as so  # noqa: E402
 from stores import update_store  # noqa: E402
 
@@ -1139,9 +1140,24 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
         )
 
     if kind == "month_status":
-        # 今月の給与＋予算ダッシュボード（既存 payroll_month を再利用）
-        intent = {"intent": "payroll_month", "raw": text, "month": "今月"}
-        kind = "payroll_month"
+        store = get_store_for_user(user_id)
+        if store is None:
+            return _decorate_menu(user_id, [{"type": "text", "text": need_register_text()}])
+        if not is_user_manager(store, user_id):
+            return [{"type": "text", "text": "ダッシュボードは店長のみです。スタッフの方は「自分のシフト」「出勤」「給与 今月」をご利用ください。"}]
+        blocked = _menu_or_consent(user_id, store)
+        if blocked:
+            return blocked
+        sc, store = _scenario_for_user(user_id)
+        # sweep absences lazily so 本日の未出勤／欠勤が最新
+        from stores import update_store as _upd
+        def _refresh(st):
+            att.sweep_absences(st)
+            now = __import__("shift_rules", fromlist=["now_jst"]).now_jst()
+            att.recompute_month_actuals(st, now.year, now.month)
+        _upd(store["store_id"], _refresh)
+        store = get_store(store["store_id"]) or store
+        return dash.dashboard_messages(store, sc)
 
     def _require_store() -> tuple[dict[str, Any] | None, list[dict[str, Any]] | None]:
         store = get_store_for_user(user_id)
