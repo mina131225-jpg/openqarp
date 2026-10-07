@@ -158,6 +158,7 @@ import attendance as att  # noqa: E402
 import phase2_ui as p2ui  # noqa: E402
 import quantum_compare as qc  # noqa: E402
 import shift_rules as sr  # noqa: E402
+import command_help as cmdhelp  # noqa: E402
 import slot_optimizer as so  # noqa: E402
 from stores import update_store  # noqa: E402
 
@@ -286,10 +287,10 @@ def _looks_like_command(text: str) -> bool:
     if ob.parse_onboarding_text(text) is not None:
         return True
     kind = parse_user_intent(text).get("intent")
-    if kind != "help":
-        return True
-    import re as _re
-    return bool(_re.search(r"ヘルプ|使い方|help|メニュー", text or "", _re.I))
+    if kind in {"help", "unknown"}:
+        import re as _re
+        return bool(_re.search(r"ヘルプ|使い方|help|メニュー", text or "", _re.I))
+    return True
 
 
 def follow_messages(user_id: str) -> list[dict[str, Any]]:
@@ -1325,23 +1326,40 @@ def handle_text_message(user_id: str, text: str) -> list[dict[str, Any]]:
         )
         return msgs
 
-    if kind == "help":
-        msg = help_text()
+    if kind in {"help", "unknown"}:
         store = get_store_for_user(user_id)
-        if store:
-            member = get_member(store, user_id) or {}
-            slot = member.get("worker_id") or "—"
-            dn = member.get("display_name") or "（未設定）"
-            role = "店長" if member.get("is_manager") else "スタッフ"
-            wage = member.get("hourly_wage") or "—"
-            msg = (
-                f"所属: {store['store_name']}（{store['invite_code']}）\n"
-                f"あなたの枠: {slot} ／ 表示名: {dn} ／ 役割: {role} ／ 時給: {wage}\n\n"
-                + msg
-            )
+        role = cmdhelp.detect_role(store, user_id)
+        store_name = (store or {}).get("store_name")
+        if kind == "help":
+            msg = cmdhelp.role_help_text(role, store_name=store_name)
+            if store:
+                member = get_member(store, user_id) or {}
+                slot = member.get("worker_id") or "—"
+                dn = member.get("display_name") or "（未設定）"
+                role_jp = "店長" if member.get("is_manager") else "スタッフ"
+                wage = member.get("hourly_wage") or "—"
+                # invite_code is the user's own store code (isolation: get_store_for_user)
+                msg = (
+                    f"所属: {store['store_name']}（{store['invite_code']}）\n"
+                    f"あなたの枠: {slot} ／ 表示名: {dn} ／ 役割: {role_jp} ／ 時給: {wage}\n\n"
+                    + msg
+                )
         else:
-            msg = need_register_text() + "\n\n" + msg
-        return _decorate_menu(user_id, [{"type": "text", "text": msg}])
+            suggestion = cmdhelp.suggest_command(text, role=role)
+            msg = cmdhelp.unknown_reply_text(
+                text, role=role, store_name=store_name, suggestion=suggestion
+            )
+        items = cmdhelp.help_menu_items(role)
+        # If near-miss, prepend a message-type quick reply for the suggested command
+        if kind == "unknown":
+            suggestion = cmdhelp.suggest_command(text, role=role)
+            if suggestion:
+                from line_ui import qr_message
+                items = [qr_message(f"→ {suggestion}"[:20], suggestion)] + [
+                    i for i in items if (i.get("action") or {}).get("text") != suggestion
+                ]
+                items = items[:13]
+        return [with_quick_reply({"type": "text", "text": msg}, items)]
 
     # ---- profile: wage / hour cap / role / premium ----
     if kind == "set_wage":

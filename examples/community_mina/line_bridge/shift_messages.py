@@ -646,10 +646,11 @@ def parse_user_intent(text: str) -> dict[str, Any]:
             "hint": "例: 「希望休 日曜」または「希望休 A 土」",
         }
 
-    if re.search(r"ヘルプ|使い方|help", normalized, re.I):
+    if re.search(r"ヘルプ|使い方|help", normalized, re.I) or re.fullmatch(r"[?？]", normalized):
         return {"intent": "help", "raw": raw}
 
-    return {"intent": "help", "raw": raw}
+    # 未認識 → unknown（ヘルプ全文ダンプではなく、役割別サジェストへ）
+    return {"intent": "unknown", "raw": raw}
 
 
 
